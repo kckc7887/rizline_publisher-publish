@@ -293,7 +293,7 @@ def rollback(root, revision):
     return {"selectedLocalRelease": revision, "published": False, "summary": summary}
 
 
-def verify_remote_object(client, path, expected_size, expected_digest, allow_missing=False):
+def verify_remote_object(client, path, expected_size, expected_digest, allow_missing=False, allow_mismatch=False):
     from botocore.exceptions import ClientError
     try:
         response = client.get_object(Bucket=BUCKET, Key=path)
@@ -305,17 +305,86 @@ def verify_remote_object(client, path, expected_size, expected_digest, allow_mis
     digest, size = hashlib.sha256(), 0
     try:
         if response.get("ContentLength") != expected_size:
+            if allow_mismatch:
+                return False
             raise ValueError(f"Remote resource size mismatch: {path}")
         while chunk := body.read(1024 * 1024):
             size += len(chunk)
             if size > expected_size:
+                if allow_mismatch:
+                    return False
                 raise ValueError(f"Remote resource size mismatch: {path}")
             digest.update(chunk)
         if size != expected_size or digest.hexdigest() != expected_digest:
+            if allow_mismatch:
+                return False
             raise ValueError(f"Remote resource content digest mismatch: {path}")
     finally:
         body.close()
     return True
+
+
+def release_keys(client):
+    prefix, keys, seen_tokens = "rizline/releases/", set(), set()
+    request = {"Bucket": BUCKET, "Prefix": prefix, "MaxKeys": 1000}
+    while True:
+        page = client.list_objects_v2(**request)
+        for item in page.get("Contents", []):
+            key = item.get("Key")
+            if not isinstance(key, str) or not key.startswith(prefix):
+                raise ValueError("Remote listing returned a key outside rizline/releases/")
+            keys.add(key)
+        if type(page.get("IsTruncated")) is not bool:
+            raise ValueError("Remote listing did not confirm pagination state")
+        if not page["IsTruncated"]:
+            return keys
+        token = page.get("NextContinuationToken")
+        if not isinstance(token, str) or not token or token in seen_tokens:
+            raise ValueError("Remote listing returned invalid or repeated pagination token")
+        seen_tokens.add(token)
+        request["ContinuationToken"] = token
+
+
+def _delete_objects_content_md5(request, **kwargs):
+    # New SDKs choose CRC32 by default. S3-compatible general-purpose buckets
+    # can still require Content-MD5 over the SDK's exact serialized XML body.
+    if not isinstance(request.body, (bytes, bytearray)):
+        raise ValueError("DeleteObjects must serialize to bytes before signing")
+    if "Content-MD5" in request.headers:
+        del request.headers["Content-MD5"]
+    request.headers["Content-MD5"] = base64.b64encode(hashlib.md5(request.body, usedforsecurity=False).digest()).decode("ascii")
+
+
+def cleanup_releases(client, keep, current_data):
+    # Only visible keys are managed. Bucket versioning and historical VersionIds
+    # are intentionally outside this publication policy.
+    if not keep or any(not key.startswith("rizline/releases/") for key in keep):
+        raise ValueError("Invalid release cleanup keep set")
+
+    def verify_current():
+        verify_remote_object(client, "rizline/current.json", len(current_data), sha256(current_data))
+
+    verify_current()
+    existing = release_keys(client)
+    if missing := keep - existing:
+        raise ValueError(f"Remote release is incomplete before cleanup: {sorted(missing)}")
+    obsolete = sorted(existing - keep)
+    for offset in range(0, len(obsolete), 1000):
+        # Detect a pointer change before every destructive request. Publishers must
+        # also run serially: S3 cannot atomically condition a delete on another key.
+        verify_current()
+        batch = obsolete[offset:offset + 1000]
+        response = client.delete_objects(Bucket=BUCKET, Delete={"Objects": [{"Key": key} for key in batch], "Quiet": False})
+        if errors := response.get("Errors"):
+            details = ", ".join(f"{error.get('Key')} ({error.get('Code')})" for error in errors)
+            raise ValueError(f"Remote release cleanup failed: {details}")
+        if {item.get("Key") for item in response.get("Deleted", [])} != set(batch):
+            raise ValueError("Remote release cleanup did not confirm every requested deletion")
+    remaining = release_keys(client)
+    if remaining != keep:
+        raise ValueError(f"Remote release cleanup verification failed: {len(remaining - keep)} extra keys, {len(keep - remaining)} missing keys")
+    verify_current()
+    return len(obsolete)
 
 
 def publish(root, execute=False, endpoint=None, region=None, workers=4):
@@ -329,7 +398,7 @@ def publish(root, execute=False, endpoint=None, region=None, workers=4):
     manifest = read_json(contained_path(root, current["manifestPath"]))
     resources = [a["path"] for a in manifest["files"]]
     paths = resources + [current["manifestPath"], "rizline/current.json"]
-    plan = {"bucket": BUCKET, "publicBase": PUBLIC_BASE, "execute": execute, "endpoint": endpoint, "region": region, "workers": workers, "uploadOrder": paths, "summary": summary}
+    plan = {"bucket": BUCKET, "publicBase": PUBLIC_BASE, "execute": execute, "endpoint": endpoint, "region": region, "workers": workers, "uploadOrder": paths, "cleanupPrefix": "rizline/releases/", "keepKeys": resources + [current["manifestPath"]], "summary": summary}
     if not execute:
         return plan
     if not endpoint.startswith("https://"):
@@ -347,6 +416,7 @@ def publish(root, execute=False, endpoint=None, region=None, workers=4):
     # Construct the client before starting threads; sessions are not shared with workers.
     # https://docs.aws.amazon.com/boto3/latest/guide/clients.html#multithreading-or-multiprocessing-with-clients
     client = session.client("s3", endpoint_url=endpoint, config=Config(signature_version="s3v4", max_pool_connections=workers))
+    client.meta.events.register("before-sign.s3.DeleteObjects", _delete_objects_content_md5, unique_id="rizline-delete-content-md5")
     expected = {asset["path"]: (asset["size"], asset["sha256"]) for asset in manifest["files"]}
     expected[current["manifestPath"]] = (None, current["manifestSha256"])
     def upload_and_verify(path):
@@ -358,12 +428,14 @@ def publish(root, execute=False, endpoint=None, region=None, workers=4):
             expected_size, expected_digest = expected[path]
             if digest != expected_digest or expected_size is not None and len(data) != expected_size:
                 raise ValueError(f"Local release changed during publishing: {path}")
-            # Object metadata is user-controlled. Only actual GET bytes prove content integrity.
-            if verify_remote_object(client, path, len(data), digest, allow_missing=True):
-                return
+        # Object metadata is user-controlled. Only actual GET bytes prove content integrity.
+        # The mutable pointer may differ; immutable resources must never be replaced.
+        if verify_remote_object(client, path, len(data), digest, allow_missing=True, allow_mismatch=is_current):
+            return "skipped"
         request = {"Bucket": BUCKET, "Key": path, "Body": data, "ContentType": "image/png" if path.endswith(".png") else "application/json; charset=utf-8", "CacheControl": "no-cache" if is_current else "public, max-age=31536000, immutable", "Metadata": {"sha256": digest}, "ContentMD5": base64.b64encode(hashlib.md5(data, usedforsecurity=False).digest()).decode("ascii")}
         if not is_current:
             request["IfNoneMatch"] = "*"
+        outcome = "uploaded"
         try:
             client.put_object(**request)
         except ClientError as error:
@@ -372,19 +444,24 @@ def publish(root, execute=False, endpoint=None, region=None, workers=4):
                 raise
             # A competing publisher may have created this key since GET. Never overwrite it;
             # reuse it only after reading its actual contents. Missing/conflicting objects abort.
+            outcome = "skipped"
         verify_remote_object(client, path, len(data), digest)
+        return outcome
 
     # Only immutable file objects run concurrently. Exiting the pool joins all in-flight
     # jobs, including on failure, before the manifest or current pointer can be touched.
+    publication = {"resourceVersion": current["resourceVersion"], "uploaded": 0, "skipped": 0, "deleted": 0}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(upload_and_verify, path) for path in resources]
         try:
             for future in as_completed(futures):
-                future.result()
+                publication[future.result()] += 1
         except BaseException:
             for future in futures:
                 future.cancel()
             raise
-    upload_and_verify(current["manifestPath"])
-    upload_and_verify("rizline/current.json")
+    publication[upload_and_verify(current["manifestPath"])] += 1
+    publication[upload_and_verify("rizline/current.json")] += 1
+    publication["deleted"] = cleanup_releases(client, set(plan["keepKeys"]), json_bytes(current))
+    plan["publication"] = publication
     return plan

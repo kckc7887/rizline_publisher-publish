@@ -11,7 +11,9 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path, PurePosixPath
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+from xml.etree import ElementTree
 
 from rizline_publisher.core import apply_overrides, atomic_write, build, json_bytes, max_combo, publish, read_json, relative_path, rollback, sha256, supplement_template, validate_catalog, validate_release, verify_remote_object
 from rizline_publisher.__main__ import main
@@ -32,7 +34,10 @@ class MemoryS3:
     def __init__(self):
         self.values, self.order, self.requests, self.events = {}, [], [], []
         self.fail, self.corrupt_upload, self.race = False, False, None
+        self.list_requests, self.delete_requests = [], []
+        self.page_size, self.failed_deletions, self.ignored_deletions = 1000, set(), set()
         self.lock = threading.RLock()
+        self.meta = SimpleNamespace(events=Mock())
 
     @staticmethod
     def error(status):
@@ -70,6 +75,32 @@ class MemoryS3:
         self.events.append(("put", key))
         self.values[key] = {"ContentLength": len(data), "Metadata": kwargs["Metadata"], "Body": bytes([data[0] ^ 1]) + data[1:] if self.corrupt_upload else data}
 
+    def seed(self, key, data=b"old resource"):
+        self.values[key] = {"ContentLength": len(data), "Metadata": {"sha256": sha256(data)}, "Body": data}
+
+    def list_objects_v2(self, **kwargs):
+        self.list_requests.append(kwargs)
+        keys = sorted(key for key in self.values if key.startswith(kwargs["Prefix"]) and key > kwargs.get("ContinuationToken", ""))
+        page = keys[:min(kwargs["MaxKeys"], self.page_size)]
+        response = {"IsTruncated": len(page) < len(keys), "Contents": [{"Key": key} for key in page]}
+        if response["IsTruncated"]:
+            response["NextContinuationToken"] = page[-1]
+        return response
+
+    def delete_objects(self, **kwargs):
+        self.delete_requests.append(kwargs)
+        response = {"Deleted": [], "Errors": []}
+        for item in kwargs["Delete"]["Objects"]:
+            key = item["Key"]
+            self.events.append(("delete", key))
+            if key in self.failed_deletions:
+                response["Errors"].append({"Key": key, "Code": "AccessDenied"})
+            else:
+                if key not in self.ignored_deletions:
+                    self.values.pop(key, None)
+                response["Deleted"].append({"Key": key})
+        return response
+
 
 class PublisherTests(unittest.TestCase):
     def setUp(self):
@@ -83,6 +114,11 @@ class PublisherTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def execute_publish(self, client):
+        with patch("boto3.Session") as session:
+            session.return_value.client.return_value = client
+            return publish(self.output, execute=True, workers=2)
 
     def test_build_is_deterministic_preserves_input_and_override(self):
         patch_value = overrides()
@@ -374,6 +410,234 @@ class PublisherTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "content digest mismatch"):
                         publish(self.output, True, "https://s3.example.test", "test-region")
                     self.assertNotIn("rizline/current.json", client.order)
+
+    def test_real_sdk_delete_signs_md5_of_serialized_xml_without_network(self):
+        from botocore.awsrequest import AWSResponse
+        from botocore.config import Config
+        from botocore.session import Session
+
+        build(self.source, self.override, self.output)
+        plan = publish(self.output)
+        keep = set(plan["keepKeys"])
+        obsolete = 'rizline/releases/旧版/cover & <test>.png'
+        session = Session()
+        # Explicit fake credentials and null config files never consult local keys.
+        session.set_config_variable("config_file", os.devnull)
+        session.set_config_variable("credentials_file", os.devnull)
+        session.set_credentials("offline-test-id", "offline-test-secret")
+        client = session.create_client("s3", region_name="us-east-1", endpoint_url="https://example.invalid", config=Config(signature_version="s3v4"))
+        requests = []
+
+        def respond(request, **kwargs):
+            requests.append(request)
+            response = ElementTree.Element("DeleteResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+            ElementTree.SubElement(ElementTree.SubElement(response, "Deleted"), "Key").text = obsolete
+            data = ElementTree.tostring(response, encoding="utf-8")
+            return AWSResponse(request.url, 200, {"content-type": "application/xml"}, SimpleNamespace(stream=lambda: iter([data])))
+
+        client.meta.events.register("before-send.s3.DeleteObjects", respond)
+        with patch("boto3.Session") as factory, patch("rizline_publisher.core.verify_remote_object", return_value=True), patch("rizline_publisher.core.release_keys", side_effect=[keep | {obsolete}, keep]), patch.object(client._endpoint.http_session, "send", side_effect=AssertionError("Network is forbidden")) as network:
+            factory.return_value.client.return_value = client
+            result = publish(self.output, execute=True)
+        network.assert_not_called()
+        self.assertEqual(result["publication"]["deleted"], 1)
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        expected = base64.b64encode(hashlib.md5(request.body, usedforsecurity=False).digest())
+        self.assertEqual(request.headers["Content-MD5"], expected)
+        self.assertIn(b"content-md5", request.headers["Authorization"].split(b"SignedHeaders=", 1)[1].split(b",", 1)[0].split(b";"))
+        xml = ElementTree.fromstring(request.body)
+        self.assertEqual([node.text for node in xml.findall("{*}Object/{*}Key")], [obsolete])
+
+    def test_repeated_publish_skips_every_put_including_current(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        first = self.execute_publish(client)
+        count = len(first["uploadOrder"])
+        self.assertEqual(first["publication"], {"resourceVersion": first["summary"]["resourceVersion"], "uploaded": count, "skipped": 0, "deleted": 0})
+        client.order.clear()
+        client.requests.clear()
+        second = self.execute_publish(client)
+        self.assertEqual(second["publication"], {"resourceVersion": first["summary"]["resourceVersion"], "uploaded": 0, "skipped": count, "deleted": 0})
+        self.assertEqual(client.requests, [])
+        self.assertEqual(client.delete_requests, [])
+        # Reusing a pointer must still detect corrupt immutable bytes, even if its
+        # metadata claims the expected digest.
+        key = second["uploadOrder"][0]
+        client.values[key]["Body"] = bytes([client.values[key]["Body"][0] ^ 1]) + client.values[key]["Body"][1:]
+        with self.assertRaisesRegex(ValueError, "content digest mismatch"):
+            self.execute_publish(client)
+        self.assertEqual(client.requests, [])
+        self.assertEqual(client.delete_requests, [])
+
+    def test_updated_publish_keeps_only_exact_manifest_keys_and_other_prefixes(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        first = self.execute_publish(client)
+        old_keys = set(first["keepKeys"])
+        changed = overrides()
+        changed["songs"]["Song.artist.0"] = {"title": "Updated title"}
+        atomic_write(self.override, json_bytes(changed))
+        build(self.source, self.override, self.output)
+        plan = publish(self.output)
+        orphan = str(PurePosixPath(plan["keepKeys"][0]).parent / "unused.png")
+        client.seed(orphan)
+        outside = {"phigros/releases/old/catalog.json", "rizline/releases-backup/old.json", "rizline/notes.json"}
+        for key in outside:
+            client.seed(key)
+        result = self.execute_publish(client)
+        self.assertEqual(result["publication"]["deleted"], len(old_keys) + 1)
+        self.assertEqual(result["publication"]["uploaded"], len(result["uploadOrder"]))
+        self.assertEqual(set(client.values), set(result["uploadOrder"]) | outside)
+        pointer_put = max(index for index, event in enumerate(client.events) if event == ("put", "rizline/current.json"))
+        self.assertTrue(all(index > pointer_put for index, event in enumerate(client.events) if event[0] == "delete"))
+        self.assertTrue(all(request["Prefix"] == "rizline/releases/" for request in client.list_requests))
+
+    def test_unchanged_publish_still_removes_orphan_objects(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        first = self.execute_publish(client)
+        orphan = str(PurePosixPath(first["keepKeys"][0]).parent / "unused.json")
+        client.seed(orphan)
+        client.requests.clear()
+        result = self.execute_publish(client)
+        self.assertEqual(result["publication"]["uploaded"], 0)
+        self.assertEqual(result["publication"]["deleted"], 1)
+        self.assertEqual(client.requests, [])
+        self.assertNotIn(orphan, client.values)
+
+    def test_failed_update_keeps_previous_resources_and_pointer(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        first = self.execute_publish(client)
+        before = copy.deepcopy(client.values)
+        changed = overrides()
+        changed["songs"]["Song.artist.0"] = {"title": "Updated title"}
+        atomic_write(self.override, json_bytes(changed))
+        build(self.source, self.override, self.output)
+        client.fail = True
+        with self.assertRaisesRegex(OSError, "upload failed"):
+            self.execute_publish(client)
+        self.assertEqual(client.values, before)
+        self.assertEqual(client.delete_requests, [])
+        self.assertTrue(set(first["keepKeys"]).issubset(client.values))
+
+    def test_failed_current_verification_never_cleans_old_resources(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        client.seed("rizline/releases/old/catalog.json")
+        original_put = client.put_object
+
+        def corrupt_pointer(**kwargs):
+            if kwargs["Key"] == "rizline/current.json":
+                client.corrupt_upload = True
+            return original_put(**kwargs)
+
+        with patch.object(client, "put_object", side_effect=corrupt_pointer), self.assertRaisesRegex(ValueError, "content digest mismatch"):
+            self.execute_publish(client)
+        self.assertIn("rizline/releases/old/catalog.json", client.values)
+        self.assertEqual(client.delete_requests, [])
+        self.assertEqual(client.list_requests, [])
+
+    def test_cleanup_paginates_before_deleting_in_s3_sized_batches(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        client.page_size = 17
+        for index in range(1005):
+            client.seed(f"rizline/releases/old/{index:04d}.json")
+        result = self.execute_publish(client)
+        self.assertEqual(result["publication"]["deleted"], 1005)
+        self.assertEqual([len(request["Delete"]["Objects"]) for request in client.delete_requests], [1000, 5])
+        self.assertTrue(any("ContinuationToken" in request for request in client.list_requests))
+        self.assertEqual(set(client.values), set(result["uploadOrder"]))
+
+    def test_partial_delete_error_is_a_failed_publication(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        allowed, denied = "rizline/releases/old/a.json", "rizline/releases/old/b.json"
+        client.seed(allowed)
+        client.seed(denied)
+        client.failed_deletions.add(denied)
+        with self.assertRaisesRegex(ValueError, "cleanup failed.*AccessDenied"):
+            self.execute_publish(client)
+        self.assertNotIn(allowed, client.values)
+        self.assertIn(denied, client.values)
+        self.assertEqual(client.values["rizline/current.json"]["Body"], (self.output / "rizline/current.json").read_bytes())
+        client.failed_deletions.clear()
+        client.requests.clear()
+        retried = self.execute_publish(client)
+        self.assertEqual(retried["publication"]["uploaded"], 0)
+        self.assertEqual(retried["publication"]["deleted"], 1)
+        self.assertEqual(client.requests, [])
+        self.assertEqual(set(client.values), set(retried["uploadOrder"]))
+
+    def test_delete_transport_error_is_not_reported_as_success(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        old_key = "rizline/releases/old/catalog.json"
+        client.seed(old_key)
+        with patch.object(client, "delete_objects", side_effect=OSError("delete failed")), self.assertRaisesRegex(OSError, "delete failed"):
+            self.execute_publish(client)
+        self.assertIn(old_key, client.values)
+
+    def test_cleanup_verifies_remote_absence_after_success_response(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        key = "rizline/releases/old/catalog.json"
+        client.seed(key)
+        client.ignored_deletions.add(key)
+        with self.assertRaisesRegex(ValueError, "cleanup verification failed"):
+            self.execute_publish(client)
+        self.assertIn(key, client.values)
+
+    def test_cleanup_rejects_missing_kept_resource_before_deletion(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        client.seed("rizline/releases/old/catalog.json")
+        missing = publish(self.output)["keepKeys"][0]
+        original_list = client.list_objects_v2
+
+        def omit_required(**kwargs):
+            result = original_list(**kwargs)
+            result["Contents"] = [item for item in result["Contents"] if item["Key"] != missing]
+            return result
+
+        with patch.object(client, "list_objects_v2", side_effect=omit_required), self.assertRaisesRegex(ValueError, "incomplete before cleanup"):
+            self.execute_publish(client)
+        self.assertEqual(client.delete_requests, [])
+
+    def test_invalid_or_repeated_listing_token_blocks_all_deletion(self):
+        build(self.source, self.override, self.output)
+        for token in (None, "repeated"):
+            with self.subTest(token=token):
+                client = MemoryS3()
+                page = {"IsTruncated": True, "Contents": [{"Key": "rizline/releases/old/catalog.json"}], "NextContinuationToken": token}
+                with patch.object(client, "list_objects_v2", return_value=page), self.assertRaisesRegex(ValueError, "pagination token"):
+                    self.execute_publish(client)
+                self.assertEqual(client.delete_requests, [])
+
+    def test_out_of_scope_listing_key_blocks_all_deletion(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        page = {"IsTruncated": False, "Contents": [{"Key": "phigros/releases/old/catalog.json"}]}
+        with patch.object(client, "list_objects_v2", return_value=page), self.assertRaisesRegex(ValueError, "outside rizline/releases/"):
+            self.execute_publish(client)
+        self.assertEqual(client.delete_requests, [])
+
+    def test_pointer_change_during_listing_blocks_cleanup(self):
+        build(self.source, self.override, self.output)
+        client = MemoryS3()
+        client.seed("rizline/releases/old/catalog.json")
+        original_list = client.list_objects_v2
+
+        def switch_pointer(**kwargs):
+            response = original_list(**kwargs)
+            client.seed("rizline/current.json", b"another publisher selected a different version")
+            return response
+
+        with patch.object(client, "list_objects_v2", side_effect=switch_pointer), self.assertRaisesRegex(ValueError, "Remote resource size mismatch"):
+            self.execute_publish(client)
+        self.assertEqual(client.delete_requests, [])
 
 
 class ImportTests(unittest.TestCase):

@@ -1,6 +1,9 @@
 name: 构建与发布曲库
 
 on:
+  schedule:
+    # UTC 00:00 = Asia/Shanghai 08:00, once per day.
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       execute:
@@ -39,7 +42,7 @@ jobs:
       release-artifact-id: ${{ steps.release.outputs.artifact-id }}
     steps:
       - name: 检查发布分支
-        if: inputs.execute && github.ref != 'refs/heads/main'
+        if: (github.event_name == 'schedule' || inputs.execute) && github.ref != 'refs/heads/main'
         run: |
           echo '::error::实际发布仅允许从 main 运行；其它分支请取消实际上传。'
           exit 1
@@ -70,7 +73,7 @@ jobs:
           python -m rizline_publisher validate --release
       - name: 生成上传计划
         env:
-          UPLOAD_WORKERS: ${{ inputs.upload_workers }}
+          UPLOAD_WORKERS: ${{ inputs.upload_workers || '4' }}
         run: python -m rizline_publisher publish --workers "$UPLOAD_WORKERS" > work/upload-plan.json
       - name: 保存可发布资源
         id: release
@@ -95,7 +98,7 @@ jobs:
           retention-days: 90
       - name: 写入构建摘要
         env:
-          EXECUTE: ${{ inputs.execute }}
+          EXECUTE: ${{ github.event_name == 'schedule' || inputs.execute }}
         run: |
           python - <<'PY'
           import json
@@ -135,13 +138,14 @@ jobs:
           path: dist/
       - name: 验证下载产物的完整性
         run: python -m rizline_publisher validate --release
-      - name: 并行上传并切换版本
-        if: inputs.execute && github.ref == 'refs/heads/main'
+      - name: 并行上传、切换版本并清理旧资源
+        if: (github.event_name == 'schedule' || inputs.execute) && github.ref == 'refs/heads/main'
+        shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_EC2_METADATA_DISABLED: 'true'
-          UPLOAD_WORKERS: ${{ inputs.upload_workers }}
+          UPLOAD_WORKERS: ${{ inputs.upload_workers || '4' }}
         run: |
           python - <<'PY'
           import os
@@ -153,10 +157,19 @@ jobs:
               print('::error::缺少 GitHub Actions 配置：' + ', '.join(missing))
               sys.exit(1)
           PY
-          python -m rizline_publisher publish --execute --workers "$UPLOAD_WORKERS"
+          python -m rizline_publisher publish --execute --workers "$UPLOAD_WORKERS" | tee publish-result.json
       - name: 写入发布摘要
-        if: inputs.execute && github.ref == 'refs/heads/main'
+        if: (github.event_name == 'schedule' || inputs.execute) && github.ref == 'refs/heads/main'
         run: |
-          echo '## 发布完成' >> "$GITHUB_STEP_SUMMARY"
-          echo '所有资源与 manifest 已通过远端字节校验，current 已更新并验证。' >> "$GITHUB_STEP_SUMMARY"
-          echo '[公共版本指针](https://rranker-rizline-data.cn-nb1.rains3.com/rizline/current.json)' >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = json.loads(Path('publish-result.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('## 发布完成\n\n')
+              summary.write('全部资源与 current 已通过远端字节校验，S3 仅保留当前版本。\n\n')
+              summary.write('```json\n' + json.dumps(result['publication'], ensure_ascii=False, indent=2) + '\n```\n\n')
+              summary.write('[公共版本指针](https://rranker-rizline-data.cn-nb1.rains3.com/rizline/current.json)\n')
+          PY
