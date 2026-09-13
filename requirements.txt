@@ -1,0 +1,4 @@
+UnityPy==1.10.18
+# PNG bytes determine immutable release IDs; keep the validated encoder version stable.
+Pillow==11.3.0
+boto3>=1.35,<2

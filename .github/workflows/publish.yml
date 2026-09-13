@@ -1,0 +1,162 @@
+name: 构建与发布曲库
+
+on:
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: 实际上传至 S3 并切换 current（不勾选则只构建产物）
+        type: boolean
+        default: false
+      upload_workers:
+        description: 资源上传与校验并发数
+        type: choice
+        default: '4'
+        options:
+          - '4'
+          - '8'
+          - '12'
+          - '16'
+          - '1'
+
+permissions:
+  contents: read
+
+# Serialize complete publication runs so their current pointers cannot race.
+concurrency:
+  group: rizline-resource-publication
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: '1'
+
+jobs:
+  build:
+    name: 导入、校验与构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      release-artifact-id: ${{ steps.release.outputs.artifact-id }}
+    steps:
+      - name: 检查发布分支
+        if: inputs.execute && github.ref != 'refs/heads/main'
+        run: |
+          echo '::error::实际发布仅允许从 main 运行；其它分支请取消实际上传。'
+          exit 1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: 恢复上游资源缓存
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .cache/http
+          key: rizline-http-v1-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            rizline-http-v1-${{ runner.os }}-
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt
+      - name: 运行发布事务测试
+        run: python -m unittest discover -s tests -v
+      - name: 导入当前官方资源
+        run: python -m rizline_publisher import --transport urllib --workers 4
+      - name: 校验并构建不可变版本
+        run: |
+          python -m rizline_publisher validate
+          python -m rizline_publisher build
+          python -m rizline_publisher validate --release
+      - name: 生成上传计划
+        env:
+          UPLOAD_WORKERS: ${{ inputs.upload_workers }}
+        run: python -m rizline_publisher publish --workers "$UPLOAD_WORKERS" > work/upload-plan.json
+      - name: 保存可发布资源
+        id: release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rizline-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+      - name: 保存导入报告与补充表
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rizline-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/import-report.json
+            work/import-failures.json
+            work/supplement-template.json
+            work/upload-plan.json
+          if-no-files-found: ignore
+          retention-days: 90
+      - name: 写入构建摘要
+        env:
+          EXECUTE: ${{ inputs.execute }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          current = json.loads(Path('dist/rizline/current.json').read_text())
+          report = json.loads(Path('work/import-report.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('## 曲库构建完成\n\n')
+              summary.write(f"版本：`{current['resourceVersion']}`\n\n")
+              summary.write('```json\n' + json.dumps(report['summary'], ensure_ascii=False, indent=2) + '\n```\n\n')
+              summary.write('资源、报告和补充表可在本次运行的 Artifacts 下载。\n\n')
+              summary.write('等待发布任务执行；请以发布任务结果为准。\n' if os.environ['EXECUTE'] == 'true' else '本次仅构建与校验，没有上传到 S3。\n')
+          PY
+
+  publish:
+    name: 并行上传并切换版本
+    needs: build
+    if: inputs.execute && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt
+      - name: 下载本次构建的资源
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.release-artifact-id }}
+          merge-multiple: true
+          path: dist/
+      - name: 验证资源并发布
+        env:
+          RIZLINE_S3_ENDPOINT: ${{ vars.RIZLINE_S3_ENDPOINT }}
+          RIZLINE_S3_REGION: ${{ vars.RIZLINE_S3_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+          UPLOAD_WORKERS: ${{ inputs.upload_workers }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          required = ('RIZLINE_S3_ENDPOINT', 'RIZLINE_S3_REGION', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY')
+          missing = [name for name in required if not os.environ.get(name, '').strip()]
+          if missing:
+              print('::error::缺少 GitHub Actions 配置：' + ', '.join(missing))
+              sys.exit(1)
+          PY
+          python -m rizline_publisher validate --release
+          python -m rizline_publisher publish --execute --workers "$UPLOAD_WORKERS"
+      - name: 写入发布摘要
+        run: |
+          echo '## 发布完成' >> "$GITHUB_STEP_SUMMARY"
+          echo '所有资源与 manifest 已通过远端字节校验，current 已更新并验证。' >> "$GITHUB_STEP_SUMMARY"
+          echo '[公共版本指针](https://rranker-rizline-data.cn-nb1.rains3.com/rizline/current.json)' >> "$GITHUB_STEP_SUMMARY"
