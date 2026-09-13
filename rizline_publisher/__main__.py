@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -39,7 +38,7 @@ def main(argv=None):
         elif args.command == "rollback":
             result = rollback(args.output, args.resource_version)
         else:
-            result = publish(args.output, args.execute, os.environ.get("RIZLINE_S3_ENDPOINT"), os.environ.get("RIZLINE_S3_REGION"), args.workers)
+            result = publish(args.output, args.execute, workers=args.workers)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (ValueError, OSError, RuntimeError) as error:

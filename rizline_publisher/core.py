@@ -13,6 +13,9 @@ from pathlib import Path, PurePosixPath
 
 PUBLIC_BASE = "https://rranker-rizline-data.cn-nb1.rains3.com"
 BUCKET = "rranker-rizline-data"
+S3_ENDPOINT = "https://cn-nb1.rains3.com"
+# The bucket's GetBucketLocation returns an empty LocationConstraint (us-east-1).
+S3_REGION = "us-east-1"
 DIFFICULTIES = ("EZ", "HD", "IN", "AT", "SP")
 SONG_FIELDS = {"id", "title", "artist", "illustrator", "packId", "packName", "bpm", "durationSeconds", "updatedAt", "coverPath", "charts", "achievements"}
 CHART_FIELDS = {"id", "songId", "difficulty", "level", "constant", "designer", "hit", "combo", "maxScore", "riztimeHit"}
@@ -318,6 +321,8 @@ def verify_remote_object(client, path, expected_size, expected_digest, allow_mis
 def publish(root, execute=False, endpoint=None, region=None, workers=4):
     if type(workers) is not int or not 1 <= workers <= 16:
         raise ValueError("Publishing workers must be an integer between 1 and 16")
+    endpoint = endpoint or S3_ENDPOINT
+    region = region or S3_REGION
     root = Path(root)
     summary = validate_release(root)
     current = read_json(root / "rizline/current.json")
@@ -327,8 +332,6 @@ def publish(root, execute=False, endpoint=None, region=None, workers=4):
     plan = {"bucket": BUCKET, "publicBase": PUBLIC_BASE, "execute": execute, "endpoint": endpoint, "region": region, "workers": workers, "uploadOrder": paths, "summary": summary}
     if not execute:
         return plan
-    if not endpoint or not region:
-        raise ValueError("Publishing requires explicit RIZLINE_S3_ENDPOINT and RIZLINE_S3_REGION")
     if not endpoint.startswith("https://"):
         raise ValueError("S3 endpoint must use HTTPS")
     import boto3

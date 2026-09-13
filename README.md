@@ -11,21 +11,18 @@
 - **校验发布器**：每次 push、Pull Request 或手动运行时，在 Ubuntu / Python 3.13 安装依赖，执行单元测试、语法与人工修订文件检查。不读取发布密钥。
 - **构建与发布曲库**：手动运行，导入当前官方资源、校验、构建并保存可发布资源，再由单独任务下载并验证产物完整性。默认不写入 S3；勾选“实际上传至 S3 并切换 current”后，发布步骤才会使用密钥上传，且只允许从 `main` 发布。
 
-### 配置 Secrets 与 Variables
+### 只需配置两个 KEY
 
-进入仓库 **Settings → Secrets and variables → Actions**，分别在 Secrets 和 Variables 中创建以下仓库级配置：
+进入仓库 **Settings → Secrets and variables → Actions → New repository secret**，只创建以下两项：
 
 | 类型 | 名称 | 填写内容 |
 | --- | --- | --- |
 | Secret，必填 | `AWS_ACCESS_KEY_ID` | 对象存储访问密钥 ID |
 | Secret，必填 | `AWS_SECRET_ACCESS_KEY` | 与该 ID 配对的访问密钥 |
-| Secret，仅临时凭据需要 | `AWS_SESSION_TOKEN` | 服务商签发的临时会话令牌；长期密钥不创建此项 |
-| Variable，必填 | `RIZLINE_S3_ENDPOINT` | 服务商提供的 HTTPS S3 写入 endpoint |
-| Variable，必填 | `RIZLINE_S3_REGION` | 服务商提供的签名 region |
 
-固定目标桶为 `rranker-rizline-data`，无需另建桶名变量。endpoint 和 region 必须以存储控制台为准，公开读取域名不是写入 endpoint 的推导依据。密钥需有该桶 `rizline/` 对象的 `s3:GetObject`、`s3:PutObject`，以及桶级 `s3:ListBucket` 权限：按 [S3 GetObject 规则](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html)，缺少 ListBucket 时，不存在对象可能返回 403，发布器不能把它误认为可上传的新对象。工作流不修改桶配置或 ACL，也不删除旧版本。匿名读取在存储侧配置。
+API 端点、桶名和签名参数均已内置，不需要创建 Variables 或其它 Secret。两个 KEY 都填写雨云对象存储提供的对应值。
 
-无需额外创建 GitHub PAT、`GITHUB_TOKEN` 或 GitHub Environment。未配置上述值时仍能运行校验和只构建模式；实际发布缺少配置会明确失败。
+没有 KEY 时仍可运行校验和只构建模式；实际上传只检查这两个 KEY 是否已配置。
 
 ### 运行与下载
 
@@ -105,17 +102,16 @@ py -m venv .venv
 
 `https://rranker-rizline-data.cn-nb1.rains3.com`
 
-必须自行配置服务商提供的写入 endpoint 和 region，不能从公开读取域名推断。认证使用 boto3 标准凭据链，支持环境变量、共享凭据文件或 AWS profile；项目不保存或打印密钥。
+本地 CLI 与工作流共用 `core.publish` 的内置目标：API 端点 `https://cn-nb1.rains3.com`，桶名 `rranker-rizline-data`，签名区域 `us-east-1`。该桶的实际 GetBucketLocation 响应为零长度 LocationConstraint，按 [S3 协议定义](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketLocation.html) 对应 `us-east-1`；用户无需填写这些参数。认证使用 boto3 标准凭据链，项目不保存或打印密钥。
 
 ```powershell
-$env:RIZLINE_S3_ENDPOINT = 'https://服务商提供的S3写入endpoint'
-$env:RIZLINE_S3_REGION = '服务商提供的region'
-$env:AWS_PROFILE = '已在本机配置的profile名称'
+$env:AWS_ACCESS_KEY_ID = '你的 Access Key'
+$env:AWS_SECRET_ACCESS_KEY = '你的 Secret Key'
 .\.venv\Scripts\python.exe -X utf8 -m rizline_publisher publish
 .\.venv\Scripts\python.exe -X utf8 -m rizline_publisher publish --execute --workers 4
 ```
 
-也可使用服务商提供的 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`，临时凭据额外需要 `AWS_SESSION_TOKEN`。请在本机自行设置，不写进项目文件。所需对象读写和桶级 ListBucket 权限见上文；工具不修改桶配置或对象 ACL。桶的匿名公开读取策略应由存储侧配置。
+已有本机 AWS profile 时也可使用 `AWS_PROFILE`。不要把实际 KEY 写进项目文件。密钥需有目标桶的对象读写权限及桶级 ListBucket 权限，以便区分不存在的对象；工具不修改桶配置或对象 ACL。桶的匿名公开读取策略应由存储侧配置。
 
 实际上传前校验本地版本全部 SHA-256 和文件大小；封面与曲库默认以 4 并发上传，`publish --workers N` 可设为 1–16。每个任务包含远端对象 GET，读取实际字节并重新计算 SHA-256 和大小；全部资源任务完成后再串行上传并核验 manifest，最后更新 `rizline/current.json`。current 上传后同样读取实际字节核验。对象自带的 `Metadata.sha256` 仅用于信息记录，不作为内容已验证的依据。
 

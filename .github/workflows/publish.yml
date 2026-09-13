@@ -138,11 +138,8 @@ jobs:
       - name: 并行上传并切换版本
         if: inputs.execute && github.ref == 'refs/heads/main'
         env:
-          RIZLINE_S3_ENDPOINT: ${{ vars.RIZLINE_S3_ENDPOINT }}
-          RIZLINE_S3_REGION: ${{ vars.RIZLINE_S3_REGION }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
           AWS_EC2_METADATA_DISABLED: 'true'
           UPLOAD_WORKERS: ${{ inputs.upload_workers }}
         run: |
@@ -150,7 +147,7 @@ jobs:
           import os
           import sys
 
-          required = ('RIZLINE_S3_ENDPOINT', 'RIZLINE_S3_REGION', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY')
+          required = ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY')
           missing = [name for name in required if not os.environ.get(name, '').strip()]
           if missing:
               print('::error::缺少 GitHub Actions 配置：' + ', '.join(missing))

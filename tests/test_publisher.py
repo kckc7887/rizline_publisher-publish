@@ -3,6 +3,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 import struct
 import tempfile
 import threading
@@ -172,8 +173,24 @@ class PublisherTests(unittest.TestCase):
         self.assertFalse(result["execute"])
         self.assertEqual(result["workers"], 4)
         self.assertEqual(result["uploadOrder"][-1], "rizline/current.json")
-        with self.assertRaisesRegex(ValueError, "explicit"):
+        with patch("boto3.Session") as session, self.assertRaisesRegex(ValueError, "No AWS credentials"):
+            session.return_value.get_credentials.return_value = None
             publish(self.output, execute=True)
+
+    def test_cli_publishes_with_only_two_keys_and_builtin_destination(self):
+        build(self.source, self.override, self.output)
+        client, output = MemoryS3(), io.StringIO()
+        credentials = {"AWS_ACCESS_KEY_ID": "test-access-key", "AWS_SECRET_ACCESS_KEY": "test-secret-key"}
+        # Use the real boto3 environment credential provider; replace only its HTTP client.
+        with patch.dict(os.environ, credentials, clear=True), patch("boto3.Session.client", return_value=client) as factory, redirect_stdout(output):
+            self.assertEqual(main(["--output", str(self.output), "publish", "--execute"]), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["endpoint"], "https://cn-nb1.rains3.com")
+        self.assertEqual(result["region"], "us-east-1")
+        self.assertEqual(result["bucket"], "rranker-rizline-data")
+        self.assertEqual(factory.call_args.kwargs["endpoint_url"], result["endpoint"])
+        self.assertEqual(client.order[-1], "rizline/current.json")
+        self.assertEqual(client.values["rizline/current.json"]["Body"], (self.output / "rizline/current.json").read_bytes())
 
     def test_publish_workers_are_bounded_and_cli_forwards_the_selection(self):
         build(self.source, self.override, self.output)
@@ -183,7 +200,7 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(publish(self.output, workers=16)["workers"], 16)
         with patch("rizline_publisher.__main__.publish", return_value={}) as publisher, redirect_stdout(io.StringIO()):
             self.assertEqual(main(["publish", "--workers", "6"]), 0)
-            self.assertEqual(publisher.call_args.args[-1], 6)
+            self.assertEqual(publisher.call_args.kwargs["workers"], 6)
         for workers in ("0", "17"):
             with self.subTest(workers=workers), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
                 main(["publish", "--workers", workers])
