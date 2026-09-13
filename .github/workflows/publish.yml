@@ -28,6 +28,7 @@ concurrency:
 
 env:
   PYTHONUTF8: '1'
+  PYTHONUNBUFFERED: '1'
 
 jobs:
   build:
@@ -112,9 +113,8 @@ jobs:
           PY
 
   publish:
-    name: 并行上传并切换版本
+    name: 验证产物与按需发布
     needs: build
-    if: inputs.execute && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -133,7 +133,10 @@ jobs:
           artifact-ids: ${{ needs.build.outputs.release-artifact-id }}
           merge-multiple: true
           path: dist/
-      - name: 验证资源并发布
+      - name: 验证下载产物的完整性
+        run: python -m rizline_publisher validate --release
+      - name: 并行上传并切换版本
+        if: inputs.execute && github.ref == 'refs/heads/main'
         env:
           RIZLINE_S3_ENDPOINT: ${{ vars.RIZLINE_S3_ENDPOINT }}
           RIZLINE_S3_REGION: ${{ vars.RIZLINE_S3_REGION }}
@@ -153,9 +156,9 @@ jobs:
               print('::error::缺少 GitHub Actions 配置：' + ', '.join(missing))
               sys.exit(1)
           PY
-          python -m rizline_publisher validate --release
           python -m rizline_publisher publish --execute --workers "$UPLOAD_WORKERS"
       - name: 写入发布摘要
+        if: inputs.execute && github.ref == 'refs/heads/main'
         run: |
           echo '## 发布完成' >> "$GITHUB_STEP_SUMMARY"
           echo '所有资源与 manifest 已通过远端字节校验，current 已更新并验证。' >> "$GITHUB_STEP_SUMMARY"
