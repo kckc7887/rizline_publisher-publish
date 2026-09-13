@@ -23,7 +23,7 @@
 | Variable，必填 | `RIZLINE_S3_ENDPOINT` | 服务商提供的 HTTPS S3 写入 endpoint |
 | Variable，必填 | `RIZLINE_S3_REGION` | 服务商提供的签名 region |
 
-固定目标桶为 `rranker-rizline-data`，无需另建桶名变量。endpoint 和 region 必须以存储控制台为准，公开读取域名不是写入 endpoint 的推导依据。密钥需能读取和写入该桶的 `rizline/` 对象；工作流不修改桶配置或 ACL，也不删除旧版本。匿名读取在存储侧配置。
+固定目标桶为 `rranker-rizline-data`，无需另建桶名变量。endpoint 和 region 必须以存储控制台为准，公开读取域名不是写入 endpoint 的推导依据。密钥需有该桶 `rizline/` 对象的 `s3:GetObject`、`s3:PutObject`，以及桶级 `s3:ListBucket` 权限：按 [S3 GetObject 规则](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html)，缺少 ListBucket 时，不存在对象可能返回 403，发布器不能把它误认为可上传的新对象。工作流不修改桶配置或 ACL，也不删除旧版本。匿名读取在存储侧配置。
 
 无需额外创建 GitHub PAT、`GITHUB_TOKEN` 或 GitHub Environment。未配置上述值时仍能运行校验和只构建模式；实际发布缺少配置会明确失败。
 
@@ -55,7 +55,7 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -X utf8 -m rizline_publisher publish
 ```
 
-`publish` 默认只展示上传计划。`import` 初次需要下载约百 MB 的索引资源、全部谱面、封面和完整音频；后续复用按 URL 存储的本地缓存。音频只用来读取完整时长，不进入发布目录。导入默认 4 个并发，可用 `import --workers 2` 降低并发。中途失败可直接重试，旧曲库不会被部分结果替换。
+`publish` 默认只展示上传计划。`import` 初次需要下载当前版本的索引资源、全部谱面、封面和完整音频；后续复用按 URL 存储的本地缓存。音频只用来读取完整时长，不进入发布目录。导入默认 4 个并发，可用 `import --workers 2` 降低并发。中途失败可直接重试，旧曲库不会被部分结果替换。
 
 已有依赖时可直接将上面的 `.\.venv\Scripts\python.exe` 换成 `py`。
 
@@ -113,7 +113,7 @@ $env:AWS_PROFILE = '已在本机配置的profile名称'
 .\.venv\Scripts\python.exe -X utf8 -m rizline_publisher publish --execute --workers 4
 ```
 
-也可使用服务商提供的 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`，临时凭据额外需要 `AWS_SESSION_TOKEN`。请在本机自行设置，不写进项目文件。需要对目标前缀拥有对象读取/HEAD和写入权限；工具不修改桶配置或对象 ACL。桶的匿名公开读取策略应由存储侧配置。
+也可使用服务商提供的 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`，临时凭据额外需要 `AWS_SESSION_TOKEN`。请在本机自行设置，不写进项目文件。所需对象读写和桶级 ListBucket 权限见上文；工具不修改桶配置或对象 ACL。桶的匿名公开读取策略应由存储侧配置。
 
 实际上传前校验本地版本全部 SHA-256 和文件大小；封面与曲库默认以 4 并发上传，`publish --workers N` 可设为 1–16。每个任务包含远端对象 GET，读取实际字节并重新计算 SHA-256 和大小；全部资源任务完成后再串行上传并核验 manifest，最后更新 `rizline/current.json`。current 上传后同样读取实际字节核验。对象自带的 `Metadata.sha256` 仅用于信息记录，不作为内容已验证的依据。
 
