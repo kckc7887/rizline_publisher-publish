@@ -34,7 +34,7 @@ jobs:
   build:
     name: 导入、校验与构建
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     outputs:
       release-artifact-id: ${{ steps.release.outputs.artifact-id }}
     steps:
