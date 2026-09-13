@@ -1,3 +1,7 @@
+# Unity bundle decoding uses the installed UnityPy package (MIT).
+# Optional limmy114/rizline-tool input is read only as a data literal; its
+# JavaScript is neither executed nor ported. See THIRD_PARTY_NOTICES.md for
+# dependency licenses and the distinction between code and data references.
 from __future__ import annotations
 
 import base64

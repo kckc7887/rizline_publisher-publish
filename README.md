@@ -4,6 +4,8 @@
 
 本项目不登录游戏账号、不请求验证码、不导入玩家存档。
 
+第三方代码来源、直接 Python 依赖的许可证及引用边界见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。音频格式参考代码的完整上游许可保存在 [LICENSES/vgmstream-COPYING.txt](LICENSES/vgmstream-COPYING.txt)，各许可仅适用于对应第三方代码。
+
 ## GitHub Actions
 
 仓库：<https://github.com/kckc7887/rizline_publisher-publish>。工作流分为两条：
@@ -150,7 +152,7 @@ Get-ChildItem -LiteralPath '.\dist\rizline\releases' -Directory | Select-Object 
 - BPM 是官方谱面 `bPM × bpmShifts.value` 的范围，消除 float32 误差后保留最多三位小数。它包含谱面中的速度变化，允许用核实的歌曲 BPM 进行人工修订。
 - HIT 为所有 note 数量加 HOLD 数量，HOLD 头尾分别计入。COMBO 使用实际 HIT 分段倍率：前 5 HIT 各 1、接着 3 HIT 各 2、接着 3 HIT 各 3、其后各 4。
 - Riztime HIT 初始补充源固定为 [limmy114/rizline-tool 的已审阅提交](https://github.com/limmy114/rizline-tool/blob/a7e1ae23aaae215c36710899af363bc71ae32634/index.html)。只解析其中 JSON 数据字面量，不执行网页 JavaScript。使用“曲名标准化或已审阅 ID 别名 + 官方 HIT 一致”双重匹配；Max Score 为 `1,000,000 + 100 × Riztime HIT`。官方定数始终优先。要使用新提交，可传 `import --stats-url 'https://raw.githubusercontent.com/.../提交SHA/index.html'`；`--stats-url ''` 可完全关闭补充源。不要直接依赖浮动分支作为正式发布来源。
-- 完整时长来自官方 ACB 的 `WaveformTable.NumSamples / SamplingRate`，并与其内嵌完整 HCA 帧数、编码延迟及尾部填充交叉核验。不使用歌曲试听片段或谱面最后一个音符估算时长。格式事实参考 [CRI UTF](https://github.com/vgmstream/vgmstream/blob/master/src/util/cri_utf.c)、[AFS2](https://github.com/vgmstream/vgmstream/blob/master/src/meta/awb.c) 和 [HCA 元数据](https://github.com/vgmstream/vgmstream/blob/master/src/coding/libs/clhca.c)。仅读取格式元数据，无需解密或解码音频。
+- 完整时长来自官方 ACB 的 `WaveformTable.NumSamples / SamplingRate`，并与其内嵌完整 HCA 帧数、编码延迟及尾部填充交叉核验。不使用歌曲试听片段或谱面最后一个音符估算时长。格式实现参考 [CRI UTF](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/util/cri_utf.c)、[AFS2](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/meta/awb.c) 和 [HCA 元数据](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/coding/libs/clhca.c)，来源角色、核验快照与许可见 [第三方代码声明](THIRD_PARTY_NOTICES.md#vgmstream-格式实现参考)。仅读取格式元数据，无需解密或解码音频。
 - 相关成就的名称和条件来自官方简体中文本地化，去除显示用富文本标签。只关联条件中明确涉及的歌曲；通用成就和整个 Disc 的完成成就不散发到每首歌。普通歌曲成就不会因为同名自动附加到 SP。
 - `updatedAt` 专指游戏中歌曲/谱面的最近一次更新日期，格式 `YYYY-MM-DD`。官方资源表没有逐曲日期，所以初始值为空，待结合官方公告/Wiki 真实更新事件人工填写。HTTP Last-Modified、Wiki 编辑时间、导入时间均不替代这个字段。
 - 游戏美术、音乐和相关署名归原权利人所有；本项目只发布曲库元数据与展示封面，音频和谱面原文件不随发布产物上传。
@@ -179,6 +181,7 @@ dist/
 | `rizline_publisher/audio.py` | CRI UTF、AFS2、HCA 元数据时长核验 |
 | `rizline_publisher/core.py` | 唯一合同校验、人工修订合并、确定性构建和发布事务 |
 | `rizline_publisher/__main__.py` | CLI 编排与错误出口 |
+| `THIRD_PARTY_NOTICES.md`、`LICENSES/` | 第三方代码来源、依赖许可证和格式参考代码的完整许可 |
 | `overrides.json` | 应纳入版本管理的个人人工数据 |
 | `.github/workflows/validate.yml` | push、Pull Request 与手动校验 |
 | `.github/workflows/publish.yml` | 每日北京时间 08:00 自动发布、手动构建/发布、产物归档、并行上传和单版本清理 |

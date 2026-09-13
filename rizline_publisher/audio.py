@@ -1,3 +1,9 @@
+# CRI format references: vgmstream/vgmstream, audited source snapshot
+# e6afeaacf433bfafd38d873f80c94517e09d5b96: src/util/cri_utf.c,
+# src/meta/awb.c, and src/coding/libs/clhca.c.
+# Python implementation is limited to metadata and adds ACB/HCA consistency checks.
+# See THIRD_PARTY_NOTICES.md for source roles and LICENSES/vgmstream-COPYING.txt
+# for the complete upstream copyright, permission, and disclaimer notices.
 """Read CRI's public binary metadata; no playback, codec, or audio decryption is needed."""
 import struct
 
