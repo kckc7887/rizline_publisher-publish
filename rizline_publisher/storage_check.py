@@ -1,4 +1,4 @@
-"""Probe conditional writes on an isolated key before publishing resources.
+"""Probe conditional writes and CopyObject on isolated keys before publishing resources.
 
 Keep this small protocol helper identical in the two independent publishers.
 No release object or public pointer is read, overwritten, or deleted here.
@@ -86,3 +86,43 @@ def verify_conditional_writes(client: Any, bucket: str, prefix: str) -> dict[str
                 raise RuntimeError(f"S3 条件写入探针清理失败，发布已停止（{key}）{detail}") from error
     return {"conditionalWrites": True, "probeKey": key}
 
+
+def verify_object_copy(client: Any, bucket: str, prefix: str) -> dict[str, Any]:
+    """Require same-bucket CopyObject to copy exact bytes to a new key."""
+    if not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", prefix):
+        raise ValueError("存储能力检查需要独立的游戏名称前缀")
+    nonce = uuid4().hex
+    source = f"{prefix}/publisher-checks/{nonce}-src"
+    dest = f"{prefix}/publisher-checks/{nonce}-dst"
+    payload = f"publisher-copy-check:{nonce}".encode("ascii")
+    owned: list[str] = []
+    failure = None
+    try:
+        client.put_object(
+            Bucket=bucket, Key=source, Body=payload, ContentType="application/octet-stream",
+            CacheControl="no-store",
+            ContentMD5=base64.b64encode(hashlib.md5(payload).digest()).decode("ascii"),
+            IfNoneMatch="*",
+        )
+        owned.append(source)
+        client.copy_object(Bucket=bucket, Key=dest, CopySource={"Bucket": bucket, "Key": source})
+        owned.append(dest)
+        response = client.get_object(Bucket=bucket, Key=dest)
+        body = response["Body"]
+        try:
+            data = body.read(len(payload) + 1)
+        finally:
+            body.close()
+        if data != payload or response.get("ContentLength") != len(payload):
+            raise RuntimeError("S3 CopyObject 未把源对象原样复制到目标键")
+    except Exception as error:
+        failure = error
+        raise RuntimeError(f"S3 CopyObject 能力检查失败，发布已停止（{source} → {dest}）：{error}") from error
+    finally:
+        for key in owned:
+            try:
+                client.delete_object(Bucket=bucket, Key=key)
+            except Exception as error:
+                detail = f"；原始错误：{failure}" if failure is not None else ""
+                raise RuntimeError(f"S3 CopyObject 探针清理失败，发布已停止（{key}）{detail}") from error
+    return {"objectCopy": True, "copyProbe": dest}

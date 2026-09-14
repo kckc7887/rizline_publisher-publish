@@ -1,20 +1,62 @@
-"""Manifest comparison, isolated S3 publication and bounded retirement of one old release."""
+"""File-identity comparison, date-prefix delta publication and leftover release cleanup."""
 from __future__ import annotations
 
 import base64
 import copy
 import hashlib
 import json
-import uuid
+import re
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .core import (BUCKET, PUBLIC_BASE, S3_ENDPOINT, S3_REGION, atomic_write,
                    check_workers, contained_path, json_bytes, parallel_map, read_json,
                    sha256, validate_catalog_release, validate_current,
                    validate_manifest, validate_release)
-from .storage_check import verify_conditional_writes
+from .storage_check import verify_conditional_writes, verify_object_copy
 
 CURRENT = "rizline/current.json"
+RELEASES_PREFIX = "rizline/releases/"
+BEIJING = timezone(timedelta(hours=8))
+_RETRYABLE = {
+    "ConnectionClosedError", "EndpointConnectionError", "ConnectTimeoutError",
+    "ReadTimeoutError", "TimeoutError", "ProtocolError", "ConnectionError",
+}
+
+
+def beijing_release_date(now=None):
+    clock = now or datetime.now(BEIJING)
+    return clock.astimezone(BEIJING).date().isoformat()
+
+
+def next_date_name(live_name, today):
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})(?:-([1-9]\d*))?", live_name or "")
+    if not match or match.group(1) != today:
+        return today
+    return f"{today}-{int(match.group(2) or 1) + 1}"
+
+
+def _retryable(error):
+    names, current, seen = [], error, set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        names.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+    return any(name in _RETRYABLE for name in names) or "timed out" in str(error).lower()
+
+
+def _retry(operation, attempts=4):
+    last = None
+    for index in range(attempts):
+        try:
+            return operation()
+        except BaseException as error:
+            last = error
+            if not _retryable(error) or index == attempts - 1:
+                raise
+            time.sleep(min(2 ** index, 8))
+    raise last
 
 
 def make_client(endpoint, region, workers):
@@ -87,10 +129,9 @@ def verify_remote_object(client, path, expected_size, expected_digest, allow_mis
     return True
 
 
-def release_keys(client, prefix):
-    # Callers select one exact committed version, never the whole releases tree.
-    if not prefix.startswith("rizline/releases/") or not prefix.endswith("/") or len(prefix.split("/")) != 4:
-        raise ValueError("An exact release prefix is required")
+def list_keys(client, prefix):
+    if not isinstance(prefix, str) or not prefix.startswith("rizline/") or not prefix.endswith("/") or "//" in prefix:
+        raise ValueError("A rizline object prefix is required")
     keys, seen_tokens = set(), set()
     request = {"Bucket": BUCKET, "Prefix": prefix, "MaxKeys": 1000}
     while True:
@@ -98,7 +139,7 @@ def release_keys(client, prefix):
         for item in page.get("Contents", []):
             key = item.get("Key")
             if not isinstance(key, str) or not key.startswith(prefix):
-                raise ValueError("Remote listing returned a key outside the selected release")
+                raise ValueError("Remote listing returned a key outside the selected prefix")
             keys.add(key)
         if type(page.get("IsTruncated")) is not bool:
             raise ValueError("Remote listing did not confirm pagination state")
@@ -109,6 +150,13 @@ def release_keys(client, prefix):
             raise ValueError("Remote listing returned invalid or repeated pagination token")
         seen_tokens.add(token)
         request["ContinuationToken"] = token
+
+
+def release_keys(client, prefix):
+    # Callers select one exact committed version, never an unrelated tree.
+    if not prefix.startswith(RELEASES_PREFIX) or not prefix.endswith("/") or len(prefix.split("/")) != 4:
+        raise ValueError("An exact release prefix is required")
+    return list_keys(client, prefix)
 
 
 def _delete_objects_content_md5(request, **kwargs):
@@ -238,13 +286,15 @@ def validate_receipt(receipt):
         raise ValueError("Invalid cleanup receipt keys")
     if len(keys) != len(set(keys)) or len(remaining) != len(set(remaining)) or not set(remaining).issubset(keys):
         raise ValueError("Cleanup receipt may not expand its original snapshot")
-    if keys and (not old_prefix or old_prefix == new_prefix or any(not key.startswith(old_prefix) for key in keys)):
-        raise ValueError("Cleanup receipt keys must be confined to the previous release")
-    return old_prefix
+    if old_prefix == new_prefix:
+        raise ValueError("Cleanup receipt previous release must differ from the published prefix")
+    if any(not key.startswith(RELEASES_PREFIX) or key.startswith(new_prefix) or key == RELEASES_PREFIX for key in keys):
+        raise ValueError("Cleanup receipt keys must be confined to leftover release prefixes")
+    return new_prefix
 
 
 def cleanup_snapshot(client, receipt, receipt_path):
-    old_prefix = validate_receipt(receipt)
+    validate_receipt(receipt)
     expected = json_bytes(receipt["expectedCurrent"])
     deleted = 0
     try:
@@ -257,8 +307,7 @@ def cleanup_snapshot(client, receipt, receipt_path):
             errors = response.get("Errors", [])
             if not confirmed.issubset(batch):
                 raise ValueError("S3 confirmed an unrequested deletion")
-            # Verify actual absence even when the service reports a partial error.
-            existing = release_keys(client, old_prefix)
+            existing = list_keys(client, RELEASES_PREFIX)
             absent = set(batch) - existing
             receipt["remainingKeys"] = [key for key in receipt["remainingKeys"] if key not in absent]
             deleted += len(absent)
@@ -301,12 +350,52 @@ def put_verified(client, path, data, *, etag=None):
         request["IfMatch"] = etag
     else:
         request["IfNoneMatch"] = "*"
-    # No unconditional fallback and no per-file deduplication: a changed release
-    # uploads every object to its own unique namespace.
-    client.put_object(**request)
-    if path == CURRENT:
-        return verify_current(client, data)
-    verify_remote_object(client, path, len(data), sha256(data))
+    def put():
+        client.put_object(**request)
+        if path == CURRENT:
+            return verify_current(client, data)
+        verify_remote_object(client, path, len(data), sha256(data))
+    return _retry(put)
+
+
+def copy_verified(client, source, dest, size):
+    if not source.startswith(RELEASES_PREFIX) or not dest.startswith(RELEASES_PREFIX) or source == dest:
+        raise ValueError("Refusing to copy outside isolated release prefixes")
+    def copy_one():
+        client.copy_object(Bucket=BUCKET, Key=dest, CopySource={"Bucket": BUCKET, "Key": source})
+        response = client.head_object(Bucket=BUCKET, Key=dest)
+        if response.get("ContentLength") != size:
+            raise ValueError(f"Copied object size mismatch: {dest}")
+    _retry(copy_one)
+
+
+def delete_keys(client, keys):
+    remaining = list(keys)
+    while remaining:
+        batch = remaining[:1000]
+        response = client.delete_objects(Bucket=BUCKET, Delete={"Objects": [{"Key": key} for key in batch], "Quiet": False})
+        confirmed = {item.get("Key") for item in response.get("Deleted", [])}
+        errors = response.get("Errors", [])
+        remaining = [key for key in remaining if key not in (confirmed - {item.get("Key") for item in errors})]
+        if errors or confirmed != set(batch):
+            raise ValueError("Remote leftover cleanup failed")
+
+
+def allocate_revision(client, live_prefix, today):
+    live_name = live_prefix.rstrip("/").rsplit("/", 1)[-1] if live_prefix else None
+    name = next_date_name(live_name, today)
+    while True:
+        prefix = f"{RELEASES_PREFIX}{name}/"
+        existing = list_keys(client, prefix)
+        if not existing:
+            return name, prefix
+        if live_prefix and prefix == live_prefix:
+            name = next_date_name(name, today)
+            continue
+        delete_keys(client, sorted(existing))
+        if list_keys(client, prefix):
+            raise RuntimeError(f"Failed leftover prefix was not emptied: {prefix}")
+        return name, prefix
 
 
 def publish_release(root, execute=False, endpoint=None, region=None, workers=4, *, report_path=None, publication_output=None, cleanup_receipt=None):
@@ -322,11 +411,11 @@ def publish_release(root, execute=False, endpoint=None, region=None, workers=4, 
     catalog = read_json(contained_path(root, manifest["catalogPath"]))
     plan = {"bucket": BUCKET, "publicBase": PUBLIC_BASE, "execute": execute, "endpoint": endpoint, "region": region,
             "workers": workers, "uploadOrder": [a["path"] for a in manifest["files"]] + [current["manifestPath"], CURRENT],
-            "comparison": "whole-manifest", "onChange": "full-upload-to-unique-release", "summary": summary}
+            "comparison": "file-identity", "onChange": "date-prefix-delta-copy", "summary": summary}
     if not execute:
         return plan
     publication = {"status": "running", "phase": "compare", "sourceResourceVersion": current["resourceVersion"],
-                   "uploaded": 0, "skipped": 0, "deleted": 0, "currentSwitched": False,
+                   "uploaded": 0, "copied": 0, "skipped": 0, "deleted": 0, "currentSwitched": False,
                    "remainingDeletionKeys": [], "publicationOutput": str(destination), "cleanupReceipt": str(receipt_path) if receipt_path else None}
     plan["publication"] = publication
     try:
@@ -351,11 +440,13 @@ def publish_release(root, execute=False, endpoint=None, region=None, workers=4, 
         publication.setdefault("comparisonReason", "different-resource-set" if remote else "missing-remote-manifest-or-catalog")
         publication["phase"] = "verify-storage"
         publication["storageCheck"] = verify_conditional_writes(client, BUCKET, "rizline")
-        publication["phase"] = "snapshot-old-release"
-        snapshot = sorted(release_keys(client, validate_current(old_current))) if old_current else []
+        publication["storageCheck"].update(verify_object_copy(client, BUCKET, "rizline"))
         publication["phase"] = "prepare"
-        revision = current["resourceVersion"][:160] + "-p" + uuid.uuid4().hex
+        live_prefix = validate_current(old_current) if old_current else None
+        revision, new_prefix = allocate_revision(client, live_prefix, beijing_release_date())
         selected, selected_manifest = rebase_release(root, destination, revision, workers, source_current=current)
+        publication["phase"] = "snapshot-old-release"
+        snapshot = sorted(key for key in list_keys(client, RELEASES_PREFIX) if not key.startswith(new_prefix))
         receipt_path = receipt_path or root.parent / "work/cleanup-receipts" / (revision + ".json")
         if receipt_path.exists():
             raise ValueError("Cleanup receipt already exists; select a fresh receipt path to preserve its retry snapshot")
@@ -364,16 +455,25 @@ def publish_release(root, execute=False, endpoint=None, region=None, workers=4, 
         plan["uploadOrder"] = [a["path"] for a in selected_manifest["files"]] + [selected["manifestPath"], CURRENT]
         receipt = {"schemaVersion": 1, "bucket": BUCKET, "endpoint": endpoint, "region": region, "status": "prepared", "previousCurrent": old_current,
                    "expectedCurrent": selected, "expectedEtag": None, "snapshotKeys": snapshot, "remainingKeys": snapshot.copy()}
-        # Keep the retirement proof before the mutable pointer can change.
         atomic_write(receipt_path, json_bytes(receipt))
         publication["phase"] = "upload-resources"
-        def upload(asset):
+        old_rel = {}
+        if remote and live_prefix:
+            old_rel = {asset["path"][len(live_prefix):]: asset for asset in remote["manifest"]["files"]}
+        def publish_asset(asset):
+            relative = asset["path"][len(new_prefix):]
+            previous = old_rel.get(relative)
+            if previous and previous["sha256"] == asset["sha256"] and previous["size"] == asset["size"]:
+                copy_verified(client, previous["path"], asset["path"], asset["size"])
+                return "copy"
             data = contained_path(destination, asset["path"]).read_bytes()
             if len(data) != asset["size"] or sha256(data) != asset["sha256"]:
                 raise ValueError("Local publication artifact changed during upload")
             put_verified(client, asset["path"], data)
-        parallel_map(upload, selected_manifest["files"], workers)
-        publication["uploaded"] = len(selected_manifest["files"])
+            return "upload"
+        kinds = parallel_map(publish_asset, selected_manifest["files"], workers)
+        publication["copied"] = kinds.count("copy")
+        publication["uploaded"] = kinds.count("upload")
         publication["phase"] = "upload-manifest"
         data = contained_path(destination, selected["manifestPath"]).read_bytes()
         if sha256(data) != selected["manifestSha256"]:

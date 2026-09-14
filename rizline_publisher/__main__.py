@@ -32,7 +32,7 @@ def main(argv=None):
     publisher.add_argument("--report", type=Path, help="Publication success/failure JSON report")
     publisher.add_argument("--publication-output", type=Path, help="Exact selected publication artifact directory")
     publisher.add_argument("--cleanup-receipt", type=Path, help="Local exact-snapshot cleanup retry receipt")
-    cleanup = sub.add_parser("cleanup", help="Inspect or retry only the recorded old release deletions")
+    cleanup = sub.add_parser("cleanup", help="Inspect or retry recorded leftover release deletions")
     cleanup.add_argument("--receipt", type=Path, required=True)
     cleanup.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)

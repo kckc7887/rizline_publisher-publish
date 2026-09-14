@@ -89,6 +89,27 @@ class MemoryS3:
             response["NextContinuationToken"] = page[-1]
         return response
 
+    def copy_object(self, Bucket, Key, CopySource, **kwargs):
+        source = CopySource["Key"] if isinstance(CopySource, dict) else str(CopySource).split("/", 1)[-1]
+        with self.lock:
+            self.events.append(("copy", source, Key))
+            if source not in self.values:
+                raise self.error(404)
+            data = self.values[source]["Body"]
+            self.values[Key] = {"ContentLength": len(data), "Metadata": dict(self.values[source].get("Metadata") or {}), "Body": data}
+
+    def head_object(self, Bucket, Key):
+        with self.lock:
+            self.events.append(("head", Key))
+            if Key not in self.values:
+                raise self.error(404)
+            return {"ContentLength": self.values[Key]["ContentLength"]}
+
+    def delete_object(self, Bucket, Key):
+        with self.lock:
+            self.events.append(("delete_single", Key))
+            self.values.pop(Key, None)
+
     def delete_objects(self, **kwargs):
         self.delete_requests.append(kwargs)
         response = {"Deleted": [], "Errors": []}
@@ -210,6 +231,8 @@ class PublisherTests(unittest.TestCase):
         result = publish(self.output)
         self.assertFalse(result["execute"])
         self.assertEqual(result["workers"], 4)
+        self.assertEqual(result["comparison"], "file-identity")
+        self.assertEqual(result["onChange"], "date-prefix-delta-copy")
         self.assertEqual(result["uploadOrder"][-1], "rizline/current.json")
         with patch("boto3.Session") as session, self.assertRaisesRegex(RuntimeError, "No AWS credentials"):
             session.return_value.get_credentials.return_value = None
@@ -220,7 +243,7 @@ class PublisherTests(unittest.TestCase):
         client, output = MemoryS3(), io.StringIO()
         credentials = {"AWS_ACCESS_KEY_ID": "test-access-key", "AWS_SECRET_ACCESS_KEY": "test-secret-key"}
         # Use the real boto3 environment credential provider; replace only its HTTP client.
-        with patch.dict(os.environ, credentials, clear=True), patch("boto3.Session.client", return_value=client) as factory, patch("rizline_publisher.publication.verify_conditional_writes", return_value={"conditionalWrites": True}), redirect_stdout(output):
+        with patch.dict(os.environ, credentials, clear=True), patch("boto3.Session.client", return_value=client) as factory, patch("rizline_publisher.publication.verify_conditional_writes", return_value={"conditionalWrites": True}), patch("rizline_publisher.publication.verify_object_copy", return_value={"objectCopy": True}), patch("rizline_publisher.publication.beijing_release_date", return_value="2026-09-14"), redirect_stdout(output):
             self.assertEqual(main(["--output", str(self.output), "publish", "--execute"]), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result["endpoint"], "https://cn-nb1.rains3.com")

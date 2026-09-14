@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from botocore.exceptions import ClientError
-from rizline_publisher.storage_check import verify_conditional_writes
+from rizline_publisher.storage_check import verify_conditional_writes, verify_object_copy
 
 
 class ProbeStore:
@@ -18,6 +18,7 @@ class ProbeStore:
         self.deletes = []
         self.reads = []
         self.bodies = []
+        self.copies = []
         self.ignore = set()
         self.unsupported = set()
         self.constant_etag = False
@@ -55,6 +56,16 @@ class ProbeStore:
         self.bodies.append(stream)
         return {"Body": stream, "ContentLength": len(data),
                 "ETag": None if self.missing_etag else self.etag(data)}
+
+    def copy_object(self, *, Bucket, Key, CopySource, **options):
+        source = CopySource["Key"] if isinstance(CopySource, dict) else str(CopySource).split("/", 1)[-1]
+        self.copies.append((source, Key, options))
+        if "copy" in self.unsupported:
+            raise self.error("NotImplemented", 501)
+        if source not in self.objects:
+            raise self.error("NoSuchKey", 404)
+        self.objects[Key] = self.objects[source]
+        return {}
 
     def delete_object(self, *, Bucket, Key):
         self.deletes.append(Key)
@@ -163,6 +174,21 @@ class StorageCheckTests(unittest.TestCase):
         self.assertNotEqual(first["probeKey"], second["probeKey"])
         self.assertEqual(self.store.objects, self.original)
         self.assert_only_probe_was_touched()
+
+    def test_copy_probe_copies_exact_bytes_and_cleans_both_keys(self):
+        result = verify_object_copy(self.store, "bucket", "rizline")
+        self.assertTrue(result["objectCopy"])
+        self.assertEqual(self.store.objects, self.original)
+        self.assertEqual(len(self.store.copies), 1)
+        self.assertEqual(len(self.store.deletes), 2)
+        self.assertTrue(all(key.startswith("rizline/publisher-checks/") for key in self.store.deletes))
+
+    def test_copy_unsupported_aborts_and_cleans_source(self):
+        self.store.unsupported.add("copy")
+        with self.assertRaisesRegex(RuntimeError, "CopyObject"):
+            verify_object_copy(self.store, "bucket", "rizline")
+        self.assertEqual(self.store.objects, self.original)
+        self.assertEqual(len(self.store.deletes), 1)
 
 
 if __name__ == "__main__":

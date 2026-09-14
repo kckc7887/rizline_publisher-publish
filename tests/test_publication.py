@@ -17,8 +17,8 @@ from test_publisher import MemoryS3, fixture, overrides
 from rizline_publisher.core import (atomic_write, build, json_bytes, parallel_map,
                                    publish, read_json, sha256, validate_release)
 from rizline_publisher.publication import (CURRENT, _delete_objects_content_md5,
-                                          cleanup_snapshot, manifests_equal,
-                                          make_client, retry_cleanup, verify_remote_object)
+                                          beijing_release_date, cleanup_snapshot, manifests_equal,
+                                          make_client, next_date_name, retry_cleanup, verify_remote_object)
 
 
 class PublicationTests(unittest.TestCase):
@@ -34,7 +34,10 @@ class PublicationTests(unittest.TestCase):
         self.client = MemoryS3()
 
     def execute(self, **kwargs):
-        with patch("rizline_publisher.publication.make_client", return_value=self.client), patch("rizline_publisher.publication.verify_conditional_writes", return_value={"conditionalWrites": True}):
+        with patch("rizline_publisher.publication.make_client", return_value=self.client), \
+                patch("rizline_publisher.publication.verify_conditional_writes", return_value={"conditionalWrites": True}), \
+                patch("rizline_publisher.publication.verify_object_copy", return_value={"objectCopy": True}), \
+                patch("rizline_publisher.publication.beijing_release_date", return_value="2026-09-14"):
             return publish(self.output, execute=True, workers=2, **kwargs)
 
     def update(self, title="Changed"):
@@ -60,10 +63,12 @@ class PublicationTests(unittest.TestCase):
         original = (self.output / CURRENT).read_bytes()
         result = self.execute()
         selected = self.pointer()
+        self.assertEqual(selected["resourceVersion"], "2026-09-14")
         self.assertNotEqual(selected["resourceVersion"], json.loads(original)["resourceVersion"])
         self.assertEqual((self.output / CURRENT).read_bytes(), original)
         self.assertEqual(validate_release(self.root / "work/publication-release")["resourceVersion"], selected["resourceVersion"])
         self.assertEqual(result["publication"]["uploaded"], 4)
+        self.assertEqual(result["publication"]["copied"], 0)
         self.assertEqual(self.client.order[-2:], [selected["manifestPath"], CURRENT])
         for request in self.client.requests:
             self.assertEqual(request["IfNoneMatch"], "*")
@@ -72,6 +77,7 @@ class PublicationTests(unittest.TestCase):
         for path in self.client.order[:-2]:
             self.assertLess(self.client.events.index(("put", path)), self.client.events.index(("get", path)))
             self.assertLess(self.client.events.index(("get", path)), self.client.events.index(("put", selected["manifestPath"])))
+            self.assertTrue(path.startswith("rizline/releases/2026-09-14/"))
 
     def test_storage_probe_failure_stops_before_resources_and_noop_does_not_probe(self):
         with patch("rizline_publisher.publication.make_client", return_value=self.client), patch("rizline_publisher.publication.verify_conditional_writes", side_effect=RuntimeError("conditional writes unsupported")) as probe:
@@ -95,28 +101,41 @@ class PublicationTests(unittest.TestCase):
         result = self.execute()
         self.assertEqual(result["publication"]["status"], "unchanged")
         self.assertEqual(result["publication"]["uploaded"], 0)
+        self.assertEqual(result["publication"]["copied"], 0)
         self.assertFalse(self.client.requests)
         self.assertFalse(self.client.list_requests)
         self.assertEqual(self.client.events, [("get", CURRENT), ("get", selected["manifestPath"]), ("get", selected["manifestPath"].replace("manifest.json", "catalog.json"))])
         self.assertEqual((self.root / "work/publication-release" / CURRENT).read_bytes(), self.client.values[CURRENT]["Body"])
 
-    def test_any_catalog_change_uploads_every_cover_and_only_deletes_previous_snapshot(self):
-        self.execute()
+    def test_catalog_change_copies_cover_uses_date_suffix_and_sweeps_leftovers(self):
+        first = self.execute()
+        live = "rizline/releases/" + first["publication"]["resourceVersion"] + "/"
         previous = set(self.client.values) - {CURRENT}
-        unrelated = "rizline/releases/another-staged-release/cover.png"
-        self.client.seed(unrelated)
+        leftover = "rizline/releases/another-staged-release/cover.png"
+        self.client.seed(leftover)
         self.client.seed("other/object")
         self.update()
         self.client.requests.clear()
+        self.client.events.clear()
+        self.client.order.clear()
         result = self.execute()
-        self.assertEqual(result["publication"]["uploaded"], 4)
-        self.assertEqual(len([r for r in self.client.requests if r["Key"].endswith(".png")]), 1)
+        selected = self.pointer()
+        self.assertEqual(selected["resourceVersion"], "2026-09-14-2")
+        self.assertEqual(result["publication"]["copied"], 1)
+        self.assertEqual(result["publication"]["uploaded"], 3)
+        self.assertEqual(len([r for r in self.client.requests if r["Key"].endswith(".png")]), 0)
+        copies = [event for event in self.client.events if event[0] == "copy"]
+        self.assertEqual(len(copies), 1)
+        self.assertTrue(copies[0][1].endswith(".png"))
+        self.assertTrue(copies[0][2].startswith("rizline/releases/2026-09-14-2/"))
         self.assertTrue(previous.isdisjoint(self.client.values))
-        self.assertIn(unrelated, self.client.values)
+        self.assertNotIn(leftover, self.client.values)
         self.assertIn("other/object", self.client.values)
-        self.assertEqual(result["publication"]["deleted"], len(previous))
+        self.assertEqual(result["publication"]["deleted"], len(previous) + 1)
         self.assertIn("IfMatch", self.client.requests[-1])
-        self.assertTrue(all(request["Prefix"] != "rizline/releases/" for request in self.client.list_requests))
+        self.assertFalse(any(key.startswith(live) for key in self.client.order))
+        self.assertFalse(any(event[0] == "copy" and event[2].startswith(live) for event in self.client.events))
+        self.assertTrue(any(request["Prefix"] == "rizline/releases/" for request in self.client.list_requests))
 
     def test_missing_or_corrupt_manifest_at_same_deterministic_version_full_uploads_fresh_prefix(self):
         for corrupted in (False, True):
@@ -127,7 +146,11 @@ class PublicationTests(unittest.TestCase):
                     self.client.seed(old["manifestPath"], b"not the manifest")
                 else:
                     del self.client.values[old["manifestPath"]]
-                result = self.execute()
+                result = self.execute(
+                    cleanup_receipt=self.root / "work/cleanup-receipts" / f"corrupt-{corrupted}.json",
+                    publication_output=self.root / "work" / f"publication-corrupt-{corrupted}",
+                    report_path=self.root / "work" / f"publication-report-corrupt-{corrupted}.json",
+                )
                 self.assertEqual(result["publication"]["uploaded"], 4)
                 self.assertNotEqual(self.pointer()["resourceVersion"], old["resourceVersion"])
                 self.assertTrue(all(old["resourceVersion"] + "/" not in key for key in self.client.order))
@@ -204,20 +227,50 @@ class PublicationTests(unittest.TestCase):
         self.assertFalse(any(key.endswith("manifest.json") for key in self.client.values))
         self.assertEqual(self.report()["phase"], "upload-resources")
 
+    def test_failed_leftover_date_prefix_is_reused_after_wipe(self):
+        leftover = "rizline/releases/2026-09-14/covers/leftover.png"
+        self.client.seed(leftover)
+        result = self.execute()
+        self.assertEqual(result["publication"]["resourceVersion"], "2026-09-14")
+        self.assertNotIn(leftover, self.client.values)
+        self.assertTrue(any(key.startswith("rizline/releases/2026-09-14/") for key in self.client.values))
+
+    def test_date_suffix_advances_only_for_the_same_beijing_day(self):
+        self.assertEqual(next_date_name(None, "2026-09-14"), "2026-09-14")
+        self.assertEqual(next_date_name("3.20.0-uuid", "2026-09-14"), "2026-09-14")
+        self.assertEqual(next_date_name("2026-09-14", "2026-09-14"), "2026-09-14-2")
+        self.assertEqual(next_date_name("2026-09-14-2", "2026-09-14"), "2026-09-14-3")
+        self.assertEqual(next_date_name("2026-09-13", "2026-09-14"), "2026-09-14")
+        self.assertEqual(beijing_release_date(), beijing_release_date())
+
     def test_corrupt_uploaded_bytes_or_manifest_never_switch_old_current(self):
+        png = self.source.parent / "covers/test.png"
+        original_png = png.read_bytes()
         for target in (".png", "manifest.json"):
             with self.subTest(target=target):
+                png.write_bytes(original_png)
+                atomic_write(self.override, json_bytes(overrides()))
+                build(self.source, self.override, self.output)
                 self.client = MemoryS3()
                 old, _ = self.seed_build()
-                self.update(target)
+                if target == ".png":
+                    png.write_bytes(original_png + b"\x00")
+                    build(self.source, self.override, self.output)
+                else:
+                    self.update("Changed")
                 original_put = self.client.put_object
                 def corrupt(**kwargs):
                     original_put(**kwargs)
                     if kwargs["Key"].endswith(target):
                         value = self.client.values[kwargs["Key"]]
                         value["Body"] = bytes([value["Body"][0] ^ 1]) + value["Body"][1:]
+                label = "png" if target == ".png" else "manifest"
                 with patch.object(self.client, "put_object", side_effect=corrupt), self.assertRaisesRegex(RuntimeError, "digest mismatch"):
-                    self.execute()
+                    self.execute(
+                        cleanup_receipt=self.root / "work/cleanup-receipts" / f"corrupt-{label}.json",
+                        publication_output=self.root / "work" / f"publication-corrupt-{label}",
+                        report_path=self.root / "work" / f"publication-report-corrupt-{label}.json",
+                    )
                 self.assertEqual(self.pointer(), old)
                 self.assertFalse(self.client.delete_requests)
 
@@ -302,7 +355,7 @@ class PublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expand"):
             retry_cleanup(receipt_path)
 
-    def test_snapshot_pagination_and_delete_batches_do_not_include_other_staging(self):
+    def test_snapshot_pagination_and_delete_batches_sweep_foreign_staging(self):
         old, _ = self.seed_build()
         prefix = old["manifestPath"].removesuffix("manifest.json")
         for index in range(1001):
@@ -311,9 +364,10 @@ class PublicationTests(unittest.TestCase):
         self.client.seed("rizline/releases/foreign-staging/file")
         self.update()
         self.execute()
-        self.assertEqual([len(r["Delete"]["Objects"]) for r in self.client.delete_requests], [1000, 4])
-        self.assertIn("rizline/releases/foreign-staging/file", self.client.values)
+        self.assertEqual([len(r["Delete"]["Objects"]) for r in self.client.delete_requests], [1000, 5])
+        self.assertNotIn("rizline/releases/foreign-staging/file", self.client.values)
         self.assertTrue(any("ContinuationToken" in r for r in self.client.list_requests))
+        self.assertTrue(any(request["Prefix"] == "rizline/releases/" for request in self.client.list_requests))
 
     def test_pointer_change_during_final_delete_is_reported_and_not_clean_success(self):
         self.seed_build()
