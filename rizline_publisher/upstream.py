@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import base64
-import concurrent.futures
 import http.client
 import io
 import json
@@ -24,7 +23,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from .core import apply_overrides, atomic_write, json_bytes, load_overrides, max_combo, sha256, supplement_template, validate_catalog
+from .core import apply_overrides, atomic_write, check_workers, json_bytes, load_overrides, max_combo, parallel_map, sha256, supplement_template, validate_catalog
 
 CONFIG_URL = "https://rizserver.pigeongames.net/game/server_api/v1/dis"
 CONFIG_HEADERS = {"game_id": "pigeongames.rizline", "channel_id": "11", "i18n": "zh-CN"}
@@ -304,6 +303,7 @@ class Importer:
 
 
 def import_catalog(work, cache, overrides_path, transport="auto", workers=4, stats_url=STATS_URL, log=print):
+    check_workers(workers, 8)
     work = Path(work)
     overrides = load_overrides(overrides_path)
     importer = Importer(Http(cache, transport), log)
@@ -339,20 +339,18 @@ def import_catalog(work, cache, overrides_path, transport="auto", workers=4, sta
 
     def retrieve(task):
         kind, key = task
-        data = json.loads(importer.text(replacements.get(key, key))) if kind == "chart" else importer.cover(key) if kind == "cover" else importer.duration(key)
-        return task, data
+        try:
+            data = chart_stats(json.loads(importer.text(replacements.get(key, key)))) if kind == "chart" else importer.cover(key) if kind == "cover" else importer.duration(key)
+            return task, data, None
+        except Exception as error:
+            return task, None, {"kind": kind, "id": key, "error": str(error)}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(retrieve, task): task for task in tasks}
-        for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
-            task = futures[future]
-            try:
-                _, result = future.result()
-                results[task] = result
-            except Exception as error:
-                failures.append({"kind": task[0], "id": task[1], "error": str(error)})
-            if index % 25 == 0 or index == len(tasks):
-                log(f"Imported {index}/{len(tasks)} chart/cover/audio assets; failures={len(failures)}", flush=True)
+    for task, result, failure in parallel_map(retrieve, tasks, workers):
+        if failure:
+            failures.append(failure)
+        else:
+            results[task] = result
+    log(f"Imported {len(tasks)}/{len(tasks)} chart/cover/audio assets; failures={len(failures)}", flush=True)
     atomic_write(work / "import-failures.json", json_bytes(failures))
     if failures:
         raise ValueError(f"{len(failures)} official resources failed; see {work / 'import-failures.json'} (catalog unchanged)")
@@ -367,7 +365,7 @@ def import_catalog(work, cache, overrides_path, transport="auto", workers=4, sta
         matches = by_title.get(normalize_title(match_name), [])
         row = matches[0] if len(matches) == 1 else None
         for chart in song["charts"]:
-            values, bpm = chart_stats(results[("chart", chart["id"])])
+            values, bpm = results[("chart", chart["id"])]
             chart.update(values)
             bpms.update(bpm)
             verified = verified_stats(row, chart)

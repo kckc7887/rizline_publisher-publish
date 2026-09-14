@@ -10,9 +10,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from rizline_publisher.upstream import Http, HttpError
+from rizline_publisher.core import _windows_comparison_path
 
 
 class PortabilityTests(unittest.TestCase):
+    def test_extended_windows_drive_and_unc_spellings_preserve_containment(self):
+        root = _windows_comparison_path(r"D:\work\release")
+        self.assertTrue(_windows_comparison_path(r"\\?\D:\work\release\covers\hash.png").is_relative_to(root))
+        self.assertFalse(_windows_comparison_path(r"\\?\D:\work\outside\hash.png").is_relative_to(root))
+        share = _windows_comparison_path(r"\\server\share\release")
+        self.assertTrue(_windows_comparison_path(r"\\?\UNC\server\share\release\covers\hash.png").is_relative_to(share))
+        self.assertFalse(_windows_comparison_path(r"\\?\UNC\server\other\release\hash.png").is_relative_to(share))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.cache = Path(self.temp.name)

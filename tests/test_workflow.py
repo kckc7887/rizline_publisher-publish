@@ -60,6 +60,8 @@ def evaluate(expression, context):
     tree = ast.parse(expression, mode="eval")
 
     def visit(node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "always" and not node.args and not node.keywords:
+            return True
         if isinstance(node, ast.Constant) and isinstance(node.value, (str, bool)):
             return node.value
         if isinstance(node, ast.Name):
@@ -194,6 +196,35 @@ class WorkflowTests(unittest.TestCase):
         # No branch/event/run suffix: manual and scheduled runs share the same lock.
         self.assertNotIn("${{", group)
         self.assertEqual(scalar(concurrency, "cancel-in-progress", 2), "false")
+
+    def test_parse_concurrency_reaches_import_build_and_local_validation(self):
+        candidates = [step for step in self.build_steps if "$PARSE_WORKERS" in command(step)]
+        self.assertEqual(len(candidates), 2)
+        for step in candidates:
+            expression = scalar(block(step, "env", 8), "PARSE_WORKERS", 10)
+            for event, value, expected in (("schedule", "", "4"), ("workflow_dispatch", "", "4"), ("workflow_dispatch", "8", "8")):
+                self.assertEqual(evaluate(expression, context(event, parse_workers=value)), expected)
+            for line in command(step).splitlines():
+                if "$PARSE_WORKERS" in line:
+                    argv = shlex.split(line.replace("$PARSE_WORKERS", "8"))
+                    self.assertEqual(argv[argv.index("--workers") + 1], "8")
+
+    def test_real_publication_and_failure_receipts_are_archived_even_after_failure(self):
+        artifacts = [step for step in self.publish_steps if "uses: actions/upload-artifact@" in step]
+        self.assertEqual(len(artifacts), 2)
+        for step in artifacts:
+            expression = scalar(step, "if", 8)
+            self.assertIn("always()", expression)
+            self.assertTrue(evaluate(expression, context("schedule")))
+            self.assertFalse(evaluate(expression, context("workflow_dispatch", execute=False)))
+        self.assertTrue(any("path: work/publication-release/" in step for step in artifacts))
+        self.assertTrue(any("work/publication-report.json" in step and "work/cleanup-receipts/" in step for step in artifacts))
+        upload = self.one_step(self.publish_steps, lambda run: "rizline_publisher publish --execute" in run)
+        self.assertIn("set -o pipefail", command(upload))
+        summary = self.one_step(self.publish_steps, lambda run: "发布结果" in run)
+        self.assertIn("always()", scalar(summary, "if", 8))
+        self.assertIn("currentSwitched", command(summary))
+        self.assertIn("'failed'", command(summary))
 
 
 if __name__ == "__main__":

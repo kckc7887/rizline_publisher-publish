@@ -20,6 +20,15 @@ on:
           - '12'
           - '16'
           - '1'
+      parse_workers:
+        description: 资源解析、构建与本地校验并发数
+        type: choice
+        default: '4'
+        options:
+          - '4'
+          - '8'
+          - '2'
+          - '1'
 
 permissions:
   contents: read
@@ -65,12 +74,16 @@ jobs:
       - name: 运行发布事务测试
         run: python -m unittest discover -s tests -v
       - name: 导入当前官方资源
-        run: python -m rizline_publisher import --transport urllib --workers 4
+        env:
+          PARSE_WORKERS: ${{ inputs.parse_workers || '4' }}
+        run: python -m rizline_publisher import --transport urllib --workers "$PARSE_WORKERS"
       - name: 校验并构建不可变版本
+        env:
+          PARSE_WORKERS: ${{ inputs.parse_workers || '4' }}
         run: |
           python -m rizline_publisher validate
-          python -m rizline_publisher build
-          python -m rizline_publisher validate --release
+          python -m rizline_publisher build --workers "$PARSE_WORKERS"
+          python -m rizline_publisher validate --release --workers "$PARSE_WORKERS"
       - name: 生成上传计划
         env:
           UPLOAD_WORKERS: ${{ inputs.upload_workers || '4' }}
@@ -119,7 +132,7 @@ jobs:
     name: 验证产物与按需发布
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -147,6 +160,7 @@ jobs:
           AWS_EC2_METADATA_DISABLED: 'true'
           UPLOAD_WORKERS: ${{ inputs.upload_workers || '4' }}
         run: |
+          set -o pipefail
           python - <<'PY'
           import os
           import sys
@@ -157,19 +171,42 @@ jobs:
               print('::error::缺少 GitHub Actions 配置：' + ', '.join(missing))
               sys.exit(1)
           PY
-          python -m rizline_publisher publish --execute --workers "$UPLOAD_WORKERS" | tee publish-result.json
+          python -m rizline_publisher publish --execute --workers "$UPLOAD_WORKERS" --report work/publication-report.json --publication-output work/publication-release | tee publish-result.json
+      - name: 保存实际发布版本
+        if: always() && (github.event_name == 'schedule' || inputs.execute) && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rizline-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: work/publication-release/
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 90
+      - name: 保存发布报告与清理重试记录
+        if: always() && (github.event_name == 'schedule' || inputs.execute) && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rizline-publication-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            work/publication-report.json
+            work/cleanup-receipts/
+          if-no-files-found: ignore
+          retention-days: 90
       - name: 写入发布摘要
-        if: (github.event_name == 'schedule' || inputs.execute) && github.ref == 'refs/heads/main'
+        if: always() && (github.event_name == 'schedule' || inputs.execute) && github.ref == 'refs/heads/main'
         run: |
           python - <<'PY'
           import json
           import os
           from pathlib import Path
 
-          result = json.loads(Path('publish-result.json').read_text())
+          path = Path('work/publication-report.json')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
-              summary.write('## 发布完成\n\n')
-              summary.write('全部资源与 current 已通过远端字节校验，S3 仅保留当前版本。\n\n')
-              summary.write('```json\n' + json.dumps(result['publication'], ensure_ascii=False, indent=2) + '\n```\n\n')
+              summary.write('## 发布结果\n\n')
+              if not path.exists():
+                  summary.write('发布未生成报告，请检查前置步骤的错误。\n')
+              else:
+                  result = json.loads(path.read_text())['publication']
+                  summary.write({'published': '发布完成：新版已验证并切换，原 current 版本的快照资源已清理。', 'unchanged': '清单一致：跳过所有资源上传，不下载封面做比较。', 'failed': '发布失败：以阶段、currentSwitched 和剩余删除键为准；可下载报告与重试记录。'}.get(result['status'], result['status']) + '\n\n')
+                  summary.write('```json\n' + json.dumps(result, ensure_ascii=False, indent=2) + '\n```\n\n')
               summary.write('[公共版本指针](https://rranker-rizline-data.cn-nb1.rains3.com/rizline/current.json)\n')
           PY

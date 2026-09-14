@@ -31,13 +31,13 @@ API 端点、桶名和签名参数均已内置，不需要创建 Variables 或�
 ### 运行与下载
 
 1. 在 **Actions → 构建与发布曲库 → Run workflow** 选择 `main`。首次可保持实际上传不勾选，生成资源检查报告。
-2. `upload_workers` 默认 `4`，可选择 `1 / 4 / 8 / 12 / 16`；定时运行使用 `4`。它控制封面与曲库的上传及远端 GET 校验并发；上游导入另固定为 4 并发。
-3. 在运行摘要中查看版本和缺项统计，下载 `rizline-release-<运行ID>-<尝试次数>` 及 `rizline-reports-<运行ID>-<尝试次数>`。前者包含 `rizline/current.json` 和完整不可变版本，后者包含导入报告、资料补充表和上传计划；产物保留 90 天。原始音频、谱面和 HTTP 缓存不进入产物。
-4. 两个 KEY 配置完成后，每天会自动实际发布；需要立即运行时，勾选实际上传。每次重新检查上游当前版本。所有内容上传及 GET 字节校验结束后才上传 manifest，manifest 验证后最后切换 current；current 验证成功后清理旧资源，S3 只保留当前一版。发布摘要给出上传、复用和删除对象数。
+2. `upload_workers` 默认 `4`，可选择 `1 / 4 / 8 / 12 / 16`；`parse_workers` 默认 `4`，可选择 `1 / 2 / 4 / 8`。定时运行两者均为 `4`。解析、构建与本地校验复用有界工作池；每次实际上传及远端 GET 校验也并行执行，排队任务最多为工作线程数的两倍。
+3. `rizline-release-<运行ID>-<尝试次数>` 是确定性构建包，`rizline-reports-<运行ID>-<尝试次数>` 是导入报告。实际发布另存 `rizline-publication-<运行ID>-<尝试次数>`，包含真正选中的发布版本；`rizline-publication-report-<运行ID>-<尝试次数>` 包含成功或失败阶段、指针结果及精确清理重试记录。失败候选包不代表已上线，以报告为准。产物均保留 90 天，不包含原始音频、谱面或 HTTP 缓存。
+4. 两个 KEY 配置完成后，每天会自动实际发布；需要立即运行时，勾选实际上传。已有 manifest 就是资源清单：整份清单一致时跳过上传；任一资源变化或远端清单缺失、损坏时，全量上传到全新的发布版本目录。所有内容及 manifest 验证后才条件切换 current，current 验证成功后立即删除原 current 版本的上传前快照。
 
-多次发布工作流通过同一 concurrency group 串行执行，不取消正在发布的运行；资源文件在每次运行内部并行处理。失败时不会继续切换指针，排队上传会取消，已开始的资源任务会收尾。不要与本地实际发布同时执行；本地 CLI 不参与 GitHub 的工作流锁。
+多次发布工作流通过同一 concurrency group 串行执行，不取消正在发布的运行；资源文件在每次运行内部并行处理。上传失败时取消排队任务并等待在途任务结束，后续 manifest/current 阶段不执行。本地 CLI 复用相同事务；独立发布者同时运行时，current 的 ETag 条件写入阻止旧运行覆盖新指针。
 
-首次导入需要读取完整上游资源，耗时受官方服务器网络影响；首次 Ubuntu 实测约 44 分钟。构建任务设为 90 分钟上限，并缓存 `.cache/http` 供后续运行复用；该缓存不进入发布资源包。
+首次导入需要读取完整上游资源，耗时受官方服务器网络影响；首次 Ubuntu 实测约 44 分钟。构建和发布任务各设为 90 分钟上限，并缓存 `.cache/http` 供后续运行复用；该缓存不进入发布资源包。网络重试和并发均有上限。
 
 发布任务失败后，修正配置可选择 **Re-run failed jobs**；发布任务按构建任务返回的产物 ID 下载，继续使用同一份已校验资源。重新运行整个工作流则会重新导入和构建。需要保留准确旧版本用于回滚时，请在产物到期前下载归档；解压 release ZIP 到本地 `dist/` 后可使用下文的校验与发布命令。
 
@@ -117,19 +117,24 @@ $env:AWS_SECRET_ACCESS_KEY = '你的 Secret Key'
 
 已有本机 AWS profile 时也可使用 `AWS_PROFILE`。不要把实际 KEY 写进项目文件。密钥需有目标桶的对象读取、写入、删除及桶级 ListBucket 权限；工具不修改桶配置或对象 ACL。桶的匿名公开读取策略应由存储侧配置。
 
-实际上传前校验本地版本全部 SHA-256 和文件大小；封面与曲库默认以 4 并发上传，`publish --workers N` 可设为 1–16。每个任务包含远端对象 GET，读取实际字节并重新计算 SHA-256 和大小；全部资源任务完成后再串行上传并核验 manifest，最后更新 `rizline/current.json`。current 上传后同样读取实际字节核验。对象自带的 `Metadata.sha256` 仅用于信息记录，不作为内容已验证的依据。
+实际上传前并行校验本地产物的 SHA-256 与大小。发布器读取 S3 的 current、manifest 和 catalog，先检查每一级实际字节的哈希与合同。它只规范化发布版本标识和其路径前缀，再比较完整资源集合；曲库所有业务字段、封面等资源的大小及 SHA-256 必须一致。整份清单相等时不执行任何资源 PUT，也不 GET 封面来重复算哈希，不做清理。manifest 已满足资源清单需求，不生成重复资源清单。
 
-上传计划中的 `uploadOrder` 表示发布阶段顺序；资源文件在第一阶段内的实际完成顺序由并发任务决定，manifest 和 current 始终最后依次处理。
+任意资源不同，或远端 manifest/catalog 缺失、损坏时，全部资源重新上传，完全不做逐文件增量或 S3 复制。权限拒绝和网络错误会失败，不当成“资源不存在”。全量发布前先在 `rizline/publisher-checks/<唯一标识>` 用小对象验证服务端确实执行创建条件、错误 ETag 拒绝和正确 ETag 更新，并删除自己的探针对象；检查或探针清理失败时不写任何正式发布对象。清单一致时不运行探针。每次全量发布使用 `<构建版本>-p<唯一标识>` 新目录；即使缺失清单的旧目录与本地确定性版本相同，也不覆盖玩家正在使用的对象。`build` 的确定性结果和原始 `dist/` 不改变，实际候选版本单独写入 `work/publication-release/`。相同清单时也会用已验证的远端元数据和相同的本地资源重建准确归档，不下载封面。
 
-所有 PUT 都附带 `Content-MD5` 供 S3 校验传输。不可变对象还使用 `If-None-Match: *` 条件写入，防止查询之后发生并发覆盖；若并发写入返回 409/412，只在重新 GET 得到完全相同的内容时复用，否则中止，current 不切换。存储服务或本机 SDK 不支持这些标准条件时会报错，不自动降级为无条件覆盖。相关字段语义见 [S3 PutObject 文档](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html)。
+发布阶段顺序固定为：并行上传全部资源并分别 GET 验证实际字节 → 上传并验证 manifest → 条件写入 current 并 GET 验证 → 清理原 current 版本快照。资源上传、解析、哈希和校验的独立任务并行执行；版本发现的前置依赖与发布阶段屏障保持顺序。所有 PUT 附带 `Content-MD5`；资源和 manifest 使用 `If-None-Match: *`，current 使用起始读取的 ETag 做 `If-Match`，首次发布则使用 `If-None-Match: *`。409/412 冲突中止，不降级为无条件覆盖。不可变对象缓存一年，current 使用 `no-cache`。存储端必须实际支持这些标准条件，参见 [S3 PutObject 文档](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html)。
 
-已存在的不可变对象也必须逐个读取实际内容校验，相同字节直接复用；current 字节相同也不重复 PUT。因此相同输入重复发布为零上传，但仍产生约一份完整资源大小的读取流量。不可变对象缓存一年，current 使用 `no-cache`。任何不可变资源内容或大小不一致都会中止；失败时可重试。
+玩家在漫长上传期间继续读取完整旧版，指针切换之前不删旧资源。切换成功后立即清理上传前记录的**原 current 的精确版本目录快照**；不扫描整个 releases 树删除非当前资源，因此其它发布者的 staging 目录不受影响。每批最多删除 1,000 个对象，删除前及最终完成前重查 current，并校验对象实际消失。批量删除在签名之前对 SDK 序列化的 XML 计算 `Content-MD5`。本事务不清除没有被原 current 引用的历史孤儿或其它 staging 目录，也不修改桶配置、ACL、版本控制或生命周期。
 
-current 成功写入并通过远端字节校验后，分页列出 `rizline/releases/`，删除本次 manifest 与全部资源集合以外的对象（包括当前版本目录内的孤儿文件），最终核对远端集合。每批删除前重新确认 current，批量删除的单项错误会导致发布失败。上传或校验失败不会提前清理旧版；清理阶段失败时，新版 current 仍然有效，重新运行会复用已上传对象并补完清理。`rizline/releases/` 以外的对象不删除。
+采用立即清理策略后，仍持有旧曲库且未缓存封面的客户端可能需要刷新曲库；已经缓存的资源可继续离线使用。上传失败不切换；current 写入或回读失败时不开始清理，但网络异常可能使指针结果不确定，报告中 `currentSwitched: null` 表示未能确认。清理失败时新版仍可能已正常上线；重试只处理已记录的旧键，不重新上传。
 
-批量删除在 SDK 完成 XML 序列化后计算并签名 `Content-MD5`，遵守普通桶的 [DeleteObjects 校验要求](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html)，不依赖新版 SDK 默认的 CRC32 替代行为。
+`work/publication-report.json` 在实际发布成功或失败时写入阶段、计数、准确版本和未完成删除键。每次全量发布的清理记录写入独立的 `work/cleanup-receipts/<实际发布版本>.json`，在 current 切换前落盘，不覆盖以前的记录。可先查看记录的清理计划，再显式执行：
 
-S3 中只保留一版，旧版封面链接会失效；客户端已经缓存的封面仍可离线使用，未缓存封面需更新曲库后读取。此策略针对可见对象键，不修改桶版本控制、bucket policy、CORS、生命周期或公开权限。Actions 下载产物保留 90 天，供离线归档与重新发布使用。
+```powershell
+py -X utf8 -m rizline_publisher cleanup --receipt 'work/cleanup-receipts/实际发布版本.json'
+py -X utf8 -m rizline_publisher cleanup --receipt 'work/cleanup-receipts/实际发布版本.json' --execute
+```
+
+重试会验证原桶、端点、区域、目标 current 及 ETag，只删除原快照中的剩余键；current 已变化时拒绝继续清理，不能扩大删除范围。下载 Actions 报告中的清理记录也可用此命令重试。`publish --report`、`--publication-output`、`--cleanup-receipt` 可自定义报告、归档和记录路径；指定的记录文件若已存在会拒绝覆盖。
 
 ### 回滚
 
@@ -142,7 +147,7 @@ Get-ChildItem -LiteralPath '.\dist\rizline\releases' -Directory | Select-Object 
 .\.venv\Scripts\python.exe -X utf8 -m rizline_publisher publish
 ```
 
-`rollback` 先校验目标版本的所有资源，再只切换本地 current；资源缺失或摘要不一致时不切换。需要线上回滚时，使用本地保留版本或下载的 Actions 完整资源包，确认上传计划后执行 `publish --execute`。旧版会重新上传并成为唯一保留的线上版本。S3 不保留历史版本，工具不会猜选旧版本或从远端自动恢复已删除资源。
+`rollback` 先校验目标版本的所有资源，再只切换本地 current；资源缺失或摘要不一致时不切换。需要线上回滚时，使用本地保留版本或下载的 Actions 完整资源包，确认上传计划后执行 `publish --execute`。所选内容会按完整清单比较，必要时重新上传到全新的发布版本并清理此前 current 的快照。工具不会猜选旧版本或从远端自动恢复已删除资源。
 
 ## 数据来源与口径
 
@@ -179,14 +184,16 @@ dist/
 | --- | --- |
 | `rizline_publisher/upstream.py` | 唯一 HTTP/cache 边界，Addressables、官方资源导入和经核验的统计补充 |
 | `rizline_publisher/audio.py` | CRI UTF、AFS2、HCA 元数据时长核验 |
-| `rizline_publisher/core.py` | 唯一合同校验、人工修订合并、确定性构建和发布事务 |
+| `rizline_publisher/core.py` | 唯一合同校验、人工修订合并、确定性构建、有界并发与兼容发布入口 |
+| `rizline_publisher/publication.py` | 清单比较、独立版本归档、S3 条件发布与精确快照清理重试 |
+| `rizline_publisher/storage_check.py` | 独立临时键上的 S3 条件写入能力核验 |
 | `rizline_publisher/__main__.py` | CLI 编排与错误出口 |
 | `THIRD_PARTY_NOTICES.md`、`LICENSES/` | 第三方代码来源、依赖许可证和格式参考代码的完整许可 |
 | `overrides.json` | 应纳入版本管理的个人人工数据 |
 | `.github/workflows/validate.yml` | push、Pull Request 与手动校验 |
-| `.github/workflows/publish.yml` | 每日北京时间 08:00 自动发布、手动构建/发布、产物归档、并行上传和单版本清理 |
+| `.github/workflows/publish.yml` | 每日北京时间 08:00 自动发布、手动构建/发布、实际版本归档、并行上传和原 current 快照清理 |
 | `.cache/` | 只保留本地的上游原始文件缓存 |
-| `work/` | 只保留本地的导入结果、PNG、源表和审阅报告 |
+| `work/` | 只保留本地的导入结果、发布归档、报告与独立清理重试记录 |
 | `dist/` | 只保留本地的待发布资源 |
 | `tests/` | 不依赖网络的解析、校验、事务和数据边界测试 |
 
@@ -205,4 +212,4 @@ dist/
 .\.venv\Scripts\python.exe -X utf8 -m rizline_publisher validate --release
 ```
 
-测试覆盖：长键和多依赖 Addressables、SP 身份隔离、HIT统计与 BPM、统计源不匹配时保留空值、完整音频时长与编码填充、人工修订保留、确定性构建、路径越界、内容篡改、元数据正确但远端字节损坏、并发条件写入、重复发布零上传、单版本清理、分页与删除失败、上传/核验失败时保留旧版，以及每日调度和手动运行条件。S3 单元测试使用模拟客户端；真实存储验收需运行实际发布并检查摘要及最终对象集合。
+测试覆盖：长键和多依赖 Addressables、SP 身份隔离、HIT统计与 BPM、统计源不匹配时保留空值、完整音频时长与编码填充、人工修订保留、确定性构建、路径越界、内容篡改、整份清单一致时零资源 GET/PUT、任一变化全量重发、缺失/损坏清单隔离恢复、并发资源屏障、current 条件竞争、精确旧快照清理、分页与部分删除重试，以及每日调度和手动运行条件。S3 单元测试使用模拟客户端；真实存储的条件写入、公共读取与上传期间客户端体验仍需存储侧验收，单元测试不替代云端验收。
