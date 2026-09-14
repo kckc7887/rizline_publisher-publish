@@ -2,8 +2,8 @@ name: 构建与发布曲库
 
 on:
   schedule:
-    # UTC 00:00 = Asia/Shanghai 08:00, once per day.
-    - cron: '0 0 * * *'
+    # UTC 12:00 = Asia/Shanghai 20:00, once per day.
+    - cron: '0 12 * * *'
   workflow_dispatch:
     inputs:
       execute:

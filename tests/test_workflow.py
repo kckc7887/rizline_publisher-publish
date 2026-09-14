@@ -114,7 +114,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(found), 1)
         return found[0]
 
-    def test_daily_schedule_is_once_at_beijing_eight(self):
+    def test_daily_schedule_is_once_at_beijing_twenty(self):
         schedule = block(block(self.workflow, "on", 0), "schedule", 2)
         crons = re.findall(r"^    - cron: ['\"]([^'\"]+)['\"]$", schedule, re.MULTILINE)
         self.assertEqual(len(crons), 1)
@@ -122,7 +122,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual((day, month, weekday), ("*", "*", "*"))
         utc_run = datetime(2026, 9, 14, int(hour), int(minute), tzinfo=timezone.utc)
         beijing_run = utc_run.astimezone(timezone(timedelta(hours=8)))
-        self.assertEqual((beijing_run.hour, beijing_run.minute), (8, 0))
+        self.assertEqual((beijing_run.hour, beijing_run.minute), (20, 0))
 
     def test_event_matrix_controls_upload_branch_guard_and_success_summary(self):
         upload = self.one_step(self.publish_steps, lambda run: "rizline_publisher publish --execute" in run)

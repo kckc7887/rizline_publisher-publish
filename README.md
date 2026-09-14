@@ -11,9 +11,9 @@
 仓库：<https://github.com/kckc7887/rizline_publisher-publish>。工作流分为两条：
 
 - **校验发布器**：每次 push、Pull Request 或手动运行时，在 Ubuntu / Python 3.13 安装依赖，执行单元测试、语法与人工修订文件检查。不读取发布密钥。
-- **构建与发布曲库**：每天北京时间 **08:00** 从 `main` 自动导入、校验、构建并实际发布；也支持手动运行。手动默认只构建，勾选“实际上传至 S3 并切换 current”才上传。两种方式共用相同的发布事务，实际发布只允许从 `main` 执行。
+- **构建与发布曲库**：每天北京时间 **20:00** 从 `main` 自动导入、校验、构建并实际发布；也支持手动运行。手动默认只构建，勾选“实际上传至 S3 并切换 current”才上传。两种方式共用相同的发布事务，实际发布只允许从 `main` 执行。
 
-定时表达式为 UTC `0 0 * * *`，每天一次。GitHub 调度在繁忙时可能延迟，公共仓库连续 60 天没有仓库活动时可能停用定时工作流；这些是 [GitHub 调度限制](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)，不是严格准点执行保证。
+定时表达式为 UTC `0 12 * * *`，每天一次。GitHub 调度在繁忙时可能延迟，公共仓库连续 60 天没有仓库活动时可能停用定时工作流；这些是 [GitHub 调度限制](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)，不是严格准点执行保证。
 
 ### 只需配置两个 KEY
 
@@ -191,7 +191,7 @@ dist/
 | `THIRD_PARTY_NOTICES.md`、`LICENSES/` | 第三方代码来源、依赖许可证和格式参考代码的完整许可 |
 | `overrides.json` | 应纳入版本管理的个人人工数据 |
 | `.github/workflows/validate.yml` | push、Pull Request 与手动校验 |
-| `.github/workflows/publish.yml` | 每日北京时间 08:00 自动发布、手动构建/发布、实际版本归档、并行上传和原 current 快照清理 |
+| `.github/workflows/publish.yml` | 每日北京时间 20:00 自动发布、手动构建/发布、实际版本归档、并行上传和原 current 快照清理 |
 | `.cache/` | 只保留本地的上游原始文件缓存 |
 | `work/` | 只保留本地的导入结果、发布归档、报告与独立清理重试记录 |
 | `dist/` | 只保留本地的待发布资源 |
