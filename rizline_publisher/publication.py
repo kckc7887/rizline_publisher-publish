@@ -447,7 +447,7 @@ def allocate_revision(client, live_prefix, today):
         return name, prefix
 
 
-def publish_release(root, execute=False, endpoint=None, region=None, workers=4, *, report_path=None, publication_output=None, cleanup_receipt=None):
+def publish_release(root, execute=False, endpoint=None, region=None, workers=4, *, report_path=None, publication_output=None, cleanup_receipt=None, delta_only=False):
     check_workers(workers)
     root = Path(root)
     endpoint, region = endpoint or S3_ENDPOINT, region or S3_REGION
@@ -489,6 +489,8 @@ def publish_release(root, execute=False, endpoint=None, region=None, workers=4, 
             log_progress("publish unchanged; skip upload")
             return plan
         publication.setdefault("comparisonReason", "different-resource-set" if remote else "missing-remote-manifest-or-catalog")
+        if delta_only and not remote:
+            raise ValueError("Delta-only publication requires a comparable remote release; refusing a full upload")
         publication["phase"] = "verify-storage"
         log_progress("publish verify-storage")
         publication["storageCheck"] = verify_conditional_writes(client, BUCKET, "rizline")

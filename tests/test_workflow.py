@@ -221,6 +221,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(any("work/publication-report.json" in step and "work/cleanup-receipts/" in step for step in artifacts))
         upload = self.one_step(self.publish_steps, lambda run: "rizline_publisher publish --execute" in run)
         self.assertIn("set -o pipefail", command(upload))
+        self.assertIn("--delta-only", command(upload))
+        self.assertEqual(scalar(self.publish, "timeout-minutes", 4), "90")
         summary = self.one_step(self.publish_steps, lambda run: "发布结果" in run)
         self.assertIn("always()", scalar(summary, "if", 8))
         self.assertIn("currentSwitched", command(summary))

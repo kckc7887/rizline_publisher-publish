@@ -417,7 +417,7 @@ def verify_remote_object(client, path, expected_size, expected_digest, allow_mis
     return verify(client, path, expected_size, expected_digest, allow_missing, allow_mismatch)
 
 
-def publish(root, execute=False, endpoint=None, region=None, workers=4, *, report_path=None, publication_output=None, cleanup_receipt=None):
+def publish(root, execute=False, endpoint=None, region=None, workers=4, *, report_path=None, publication_output=None, cleanup_receipt=None, delta_only=False):
     from .publication import publish_release
     return publish_release(root, execute, endpoint, region, workers, report_path=report_path,
-                           publication_output=publication_output, cleanup_receipt=cleanup_receipt)
+                           publication_output=publication_output, cleanup_receipt=cleanup_receipt, delta_only=delta_only)

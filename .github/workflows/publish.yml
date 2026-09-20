@@ -132,8 +132,8 @@ jobs:
     name: 验证产物与按需发布
     needs: build
     runs-on: ubuntu-latest
-    # Hosted runner is overseas; first audio/chart PUT+GET to Ningbo can exceed 90 minutes.
-    timeout-minutes: 360
+    # Delta CopyObject stays in-region; --delta-only refuses a full overseas PUT.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -172,7 +172,7 @@ jobs:
               print('::error::缺少 GitHub Actions 配置：' + ', '.join(missing))
               sys.exit(1)
           PY
-          python -m rizline_publisher publish --execute --workers "$UPLOAD_WORKERS" --report work/publication-report.json --publication-output work/publication-release | tee publish-result.json
+          python -m rizline_publisher publish --execute --delta-only --workers "$UPLOAD_WORKERS" --report work/publication-report.json --publication-output work/publication-release | tee publish-result.json
       - name: 保存实际发布版本
         if: always() && (github.event_name == 'schedule' || inputs.execute) && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

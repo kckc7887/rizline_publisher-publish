@@ -32,6 +32,7 @@ def main(argv=None):
     publisher.add_argument("--report", type=Path, help="Publication success/failure JSON report")
     publisher.add_argument("--publication-output", type=Path, help="Exact selected publication artifact directory")
     publisher.add_argument("--cleanup-receipt", type=Path, help="Local exact-snapshot cleanup retry receipt")
+    publisher.add_argument("--delta-only", action="store_true", help="Refuse a full upload unless a comparable remote release exists")
     cleanup = sub.add_parser("cleanup", help="Inspect or retry recorded leftover release deletions")
     cleanup.add_argument("--receipt", type=Path, required=True)
     cleanup.add_argument("--execute", action="store_true")
@@ -50,7 +51,8 @@ def main(argv=None):
             result = retry_cleanup(args.receipt, args.execute)
         else:
             result = publish(args.output, args.execute, workers=args.workers, report_path=args.report,
-                             publication_output=args.publication_output, cleanup_receipt=args.cleanup_receipt)
+                             publication_output=args.publication_output, cleanup_receipt=args.cleanup_receipt,
+                             delta_only=args.delta_only)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (ValueError, OSError, RuntimeError) as error:

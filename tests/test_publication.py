@@ -237,6 +237,24 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn(leftover, self.client.values)
         self.assertTrue(any(key.startswith("rizline/releases/2026-09-14/") for key in self.client.values))
 
+    def test_delta_only_refuses_full_upload_when_remote_cannot_be_compared(self):
+        old, manifest = self.seed_build()
+        self.client.seed(manifest["catalogPath"], b"unverified catalogue")
+        with self.assertRaisesRegex(RuntimeError, "Delta-only publication requires a comparable remote release"):
+            self.execute(delta_only=True)
+        self.assertEqual(self.pointer(), old)
+        self.assertFalse(self.client.order)
+        self.assertEqual(self.report()["phase"], "compare")
+
+    def test_delta_only_still_copies_unchanged_files_when_catalog_changes(self):
+        self.execute()
+        previous = set(self.client.values) - {CURRENT}
+        self.update()
+        result = self.execute(delta_only=True)
+        self.assertEqual(result["publication"]["copied"], 3)
+        self.assertGreater(result["publication"]["uploaded"], 0)
+        self.assertTrue(previous.isdisjoint(self.client.values))
+
     def test_identical_resource_put_precondition_is_treated_as_already_uploaded(self):
         self.client.race = "identical"
         result = self.execute()
