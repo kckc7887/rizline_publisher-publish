@@ -205,6 +205,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ffmpeg", command(install))
         self.assertLess(self.build_steps.index(install), self.build_steps.index(release))
 
+    def test_http_and_transcode_caches_save_after_failure(self):
+        restores = [step for step in self.build_steps if "uses: actions/cache/restore@" in step]
+        saves = [step for step in self.build_steps if "uses: actions/cache/save@" in step]
+        self.assertEqual(len(restores), 2)
+        self.assertEqual(len(saves), 2)
+        import_step = self.one_step(self.build_steps, lambda run: "rizline_publisher import" in run)
+        build_step = self.one_step(self.build_steps, lambda run: "rizline_publisher build" in run)
+        http_save = next(step for step in saves if ".cache/http" in step)
+        transcode_save = next(step for step in saves if ".cache/transcode" in step)
+        self.assertEqual(scalar(http_save, "if", 8), "always()")
+        self.assertEqual(scalar(transcode_save, "if", 8), "always()")
+        self.assertLess(self.build_steps.index(import_step), self.build_steps.index(http_save))
+        self.assertLess(self.build_steps.index(http_save), self.build_steps.index(build_step))
+        self.assertLess(self.build_steps.index(build_step), self.build_steps.index(transcode_save))
+
     def test_parse_concurrency_reaches_import_build_and_local_validation(self):
         candidates = [step for step in self.build_steps if "$PARSE_WORKERS" in command(step)]
         self.assertEqual(len(candidates), 2)
