@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 
 from .audio import acb_duration
-from .core import apply_overrides, atomic_write, check_workers, json_bytes, load_overrides, max_combo, parallel_map, sha256, supplement_template, validate_catalog
+from .core import apply_overrides, atomic_write, check_workers, json_bytes, load_overrides, log_progress, max_combo, parallel_map, sha256, supplement_template, validate_catalog
 
 CONFIG_URL = "https://rizserver.pigeongames.net/game/server_api/v1/dis"
 CONFIG_HEADERS = {"game_id": "pigeongames.rizline", "channel_id": "11", "i18n": "zh-CN"}
@@ -305,8 +305,9 @@ class Importer:
         return acb_duration(self.acb(music_id))
 
 
-def import_catalog(work, cache, overrides_path, transport="auto", workers=4, stats_url=STATS_URL, log=print):
+def import_catalog(work, cache, overrides_path, transport="auto", workers=4, stats_url=STATS_URL, log=None):
     check_workers(workers, 8)
+    log = log or log_progress
     work = Path(work)
     overrides = load_overrides(overrides_path)
     importer = Importer(Http(cache, transport), log)
@@ -351,14 +352,19 @@ def import_catalog(work, cache, overrides_path, transport="auto", workers=4, sta
             data = importer.acb(key)
             return task, (acb_duration(data), data), None
         except Exception as error:
-            return task, None, {"kind": kind, "id": key, "error": str(error)}
+            failure = {"kind": kind, "id": key, "error": str(error)}
+            log(f"{failure['kind']} failed {failure['id']}: {failure['error']}", flush=True)
+            return task, None, failure
 
-    for task, result, failure in parallel_map(retrieve, tasks, workers):
+    def report(done, total, task):
+        kind, key = task
+        log(f"{kind} {done}/{total} {key}", flush=True)
+    for task, result, failure in parallel_map(retrieve, tasks, workers, progress=report):
         if failure:
             failures.append(failure)
         else:
             results[task] = result
-    log(f"Imported {len(tasks)}/{len(tasks)} chart/cover/audio assets; failures={len(failures)}", flush=True)
+    log(f"Imported {len(results)}/{len(tasks)} chart/cover/audio assets; failures={len(failures)}", flush=True)
     atomic_write(work / "import-failures.json", json_bytes(failures))
     if failures:
         raise ValueError(f"{len(failures)} official resources failed; see {work / 'import-failures.json'} (catalog unchanged)")

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .core import (BUCKET, PUBLIC_BASE, S3_ENDPOINT, S3_REGION, atomic_write,
-                   check_workers, contained_path, json_bytes, parallel_map, read_json,
+                   check_workers, contained_path, json_bytes, log_progress, parallel_map, read_json,
                    sha256, validate_catalog_release, validate_current,
                    validate_manifest, validate_release)
 from .storage_check import verify_conditional_writes, verify_object_copy
@@ -44,6 +44,13 @@ def _retryable(error):
         names.append(type(current).__name__)
         current = current.__cause__ or current.__context__
     return any(name in _RETRYABLE for name in names) or "timed out" in str(error).lower()
+
+
+def _precondition_failed(error):
+    response = getattr(error, "response", None) or {}
+    code = (response.get("Error") or {}).get("Code")
+    status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+    return code in ("PreconditionFailed", "412") or status == 412
 
 
 def _retry(operation, attempts=4):
@@ -237,7 +244,9 @@ def rebase_release(root, destination, revision, workers=4, remote=None, *, sourc
             raise ValueError("Refusing to overwrite an immutable publication artifact")
         atomic_write(target, data)
         return {"path": path, "size": len(data), "sha256": sha256(data)}
-    rebased["files"] = parallel_map(copy_asset, manifest["files"], workers)
+    def report(done, total, asset):
+        log_progress(f"rebase {done}/{total} {asset['path']}")
+    rebased["files"] = parallel_map(copy_asset, manifest["files"], workers, progress=report)
     manifest_data = remote["manifestRaw"] if remote else json_bytes(rebased)
     selected = {"schemaVersion": 1, "resourceVersion": revision, "manifestPath": prefix + "manifest.json", "manifestSha256": sha256(manifest_data)}
     current_data = remote["currentRaw"] if remote else json_bytes(selected)
@@ -299,6 +308,18 @@ def validate_receipt(receipt):
     if any(not key.startswith(RELEASES_PREFIX) or key.startswith(new_prefix) or key == RELEASES_PREFIX for key in keys):
         raise ValueError("Cleanup receipt keys must be confined to leftover release prefixes")
     return new_prefix
+
+
+def unused_receipt_path(path):
+    path = Path(path)
+    if not path.exists():
+        return path
+    index = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}.retry-{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def cleanup_snapshot(client, receipt, receipt_path):
@@ -366,11 +387,23 @@ def put_verified(client, path, data, *, etag=None):
         request["IfMatch"] = etag
     else:
         request["IfNoneMatch"] = "*"
+    digest = sha256(data)
     def put():
-        client.put_object(**request)
+        from botocore.exceptions import ClientError
+        try:
+            client.put_object(**request)
+        except ClientError as error:
+            # Lost PUT responses and leftover objects in a reused date prefix both
+            # surface as 412. current still fails closed; resources may already match.
+            if etag is not None or path == CURRENT or not _precondition_failed(error):
+                raise
+            log_progress(f"publish put-exists {path}")
+            verify_remote_object(client, path, len(data), digest)
+            return None
         if path == CURRENT:
             return verify_current(client, data)
-        verify_remote_object(client, path, len(data), sha256(data))
+        verify_remote_object(client, path, len(data), digest)
+        return None
     return _retry(put)
 
 
@@ -435,6 +468,7 @@ def publish_release(root, execute=False, endpoint=None, region=None, workers=4, 
                    "remainingDeletionKeys": [], "publicationOutput": str(destination), "cleanupReceipt": str(receipt_path) if receipt_path else None}
     plan["publication"] = publication
     try:
+        log_progress(f"publish compare current; execute={execute} workers={workers}")
         client = make_client(endpoint, region, workers)
         pointer = remote_bytes(client, CURRENT, maximum=65536, allow_missing=True)
         old_current, etag, remote = None, None, None
@@ -452,27 +486,35 @@ def publish_release(root, execute=False, endpoint=None, region=None, workers=4, 
             rebase_release(root, destination, remote["current"]["resourceVersion"], workers, remote, source_current=current)
             publication.update(status="unchanged", phase="complete", resourceVersion=remote["current"]["resourceVersion"],
                                skipped=len(manifest["files"]) + 2)
+            log_progress("publish unchanged; skip upload")
             return plan
         publication.setdefault("comparisonReason", "different-resource-set" if remote else "missing-remote-manifest-or-catalog")
         publication["phase"] = "verify-storage"
+        log_progress("publish verify-storage")
         publication["storageCheck"] = verify_conditional_writes(client, BUCKET, "rizline")
         publication["storageCheck"].update(verify_object_copy(client, BUCKET, "rizline"))
         publication["phase"] = "prepare"
+        log_progress("publish prepare date prefix")
         live_prefix = validate_current(old_current) if old_current else None
         revision, new_prefix = allocate_revision(client, live_prefix, beijing_release_date())
         selected, selected_manifest = rebase_release(root, destination, revision, workers, source_current=current)
         publication["phase"] = "snapshot-old-release"
         snapshot = sorted(key for key in list_keys(client, RELEASES_PREFIX) if not key.startswith(new_prefix))
+        requested_receipt = receipt_path
         receipt_path = receipt_path or root.parent / "work/cleanup-receipts" / (revision + ".json")
         if receipt_path.exists():
-            raise ValueError("Cleanup receipt already exists; select a fresh receipt path to preserve its retry snapshot")
+            if requested_receipt is not None:
+                raise ValueError("Cleanup receipt already exists; select a fresh receipt path to preserve its retry snapshot")
+            receipt_path = unused_receipt_path(receipt_path)
         publication["cleanupReceipt"] = str(receipt_path)
+        log_progress(f"publish cleanup-receipt {receipt_path}")
         publication["resourceVersion"] = revision
         plan["uploadOrder"] = [a["path"] for a in selected_manifest["files"]] + [selected["manifestPath"], CURRENT]
         receipt = {"schemaVersion": 1, "bucket": BUCKET, "endpoint": endpoint, "region": region, "status": "prepared", "previousCurrent": old_current,
                    "expectedCurrent": selected, "expectedEtag": None, "snapshotKeys": snapshot, "remainingKeys": snapshot.copy()}
         atomic_write(receipt_path, json_bytes(receipt))
         publication["phase"] = "upload-resources"
+        log_progress(f"publish upload-resources {len(selected_manifest['files'])} files")
         old_rel = {}
         if remote and live_prefix:
             old_rel = {asset["path"][len(live_prefix):]: asset for asset in remote["manifest"]["files"]}
@@ -487,16 +529,20 @@ def publish_release(root, execute=False, endpoint=None, region=None, workers=4, 
                 raise ValueError("Local publication artifact changed during upload")
             put_verified(client, asset["path"], data)
             return "upload"
-        kinds = parallel_map(publish_asset, selected_manifest["files"], workers)
+        def report(done, total, asset):
+            log_progress(f"publish {done}/{total} {asset['path']}")
+        kinds = parallel_map(publish_asset, selected_manifest["files"], workers, progress=report)
         publication["copied"] = kinds.count("copy")
         publication["uploaded"] = kinds.count("upload")
         publication["phase"] = "upload-manifest"
+        log_progress("publish upload-manifest")
         data = contained_path(destination, selected["manifestPath"]).read_bytes()
         if sha256(data) != selected["manifestSha256"]:
             raise ValueError("Local manifest changed during publication")
         put_verified(client, selected["manifestPath"], data)
         publication["uploaded"] += 1
         publication["phase"] = "switch-current"
+        log_progress("publish switch-current")
         # An exception after PUT can leave the pointer outcome uncertain. Only
         # mark it true after actual bytes have been read back successfully.
         publication["currentSwitched"] = None
@@ -505,6 +551,7 @@ def publish_release(root, execute=False, endpoint=None, region=None, workers=4, 
         publication["uploaded"] += 1
         atomic_write(receipt_path, json_bytes(receipt))
         publication["phase"] = "cleanup"
+        log_progress("publish cleanup leftovers")
         publication["deleted"] = cleanup_snapshot(client, receipt, receipt_path)
         publication.update(status="published", phase="complete")
         return plan

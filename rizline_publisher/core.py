@@ -6,6 +6,8 @@ import json
 import math
 import os
 import re
+import sys
+import threading
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -50,9 +52,21 @@ def check_workers(workers, maximum=16):
         raise ValueError(f"Workers must be an integer between 1 and {maximum}")
 
 
-def parallel_map(function, items, workers=4):
+_PROGRESS_LOCK = threading.Lock()
+
+
+def log_progress(message, **kwargs):
+    with _PROGRESS_LOCK:
+        print(message, file=sys.stderr, flush=True)
+
+
+def parallel_map(function, items, workers=4, progress=None):
     """Bound both running work and queued work; preserve deterministic result order."""
     check_workers(workers)
+    try:
+        total = len(items)
+    except TypeError:
+        total = None
     iterator, pending, results = iter(enumerate(items)), {}, {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         def fill():
@@ -61,13 +75,16 @@ def parallel_map(function, items, workers=4):
                 if item is None:
                     break
                 index, value = item
-                pending[executor.submit(function, value)] = index
+                pending[executor.submit(function, value)] = (index, value)
         try:
             fill()
             while pending:
                 completed, _ = wait(pending, return_when=FIRST_COMPLETED)
                 for future in completed:
-                    results[pending.pop(future)] = future.result()
+                    index, value = pending.pop(future)
+                    results[index] = future.result()
+                    if progress:
+                        progress(len(results), total, value)
                 fill()
         except BaseException:
             for future in pending:
@@ -248,23 +265,26 @@ def supplement_template(catalog):
 
 def build(source, overrides, output, workers=4):
     check_workers(workers)
+    log_progress(f"build hash-and-write workers={workers}")
     source, output = Path(source), Path(output)
     catalog = apply_overrides(read_json(source), load_overrides(overrides))
     atomic_write(source.parent / "supplement-template.json", json_bytes(supplement_template(catalog)))
     from .audio import acb_duration
-    def hashed_files(paths, verify):
+    def hashed_files(paths, verify, label):
         def read(path):
             data = contained_path(source.parent, path).read_bytes()
             verify(data)
             return path, sha256(data), data
-        items = parallel_map(read, sorted(paths), workers) if paths else []
+        def report(done, total, path):
+            log_progress(f"{label} {done}/{total} {path}")
+        items = parallel_map(read, sorted(paths), workers, progress=report) if paths else []
         return {digest: data for _, digest, data in items}, {path: digest for path, digest, _ in items}
     def verify_png(data):
         if not data.startswith(b"\x89PNG\r\n\x1a\n"):
             raise ValueError("Imported covers must be PNG images")
-    cover_bytes, cover_hashes = hashed_files({s["coverPath"] for s in catalog["songs"] if s["coverPath"]}, verify_png)
-    audio_bytes, audio_hashes = hashed_files({s["audioPath"] for s in catalog["songs"]}, acb_duration)
-    chart_bytes, chart_hashes = hashed_files({c["chartPath"] for s in catalog["songs"] for c in s["charts"]}, json.loads)
+    cover_bytes, cover_hashes = hashed_files({s["coverPath"] for s in catalog["songs"] if s["coverPath"]}, verify_png, "hash-cover")
+    audio_bytes, audio_hashes = hashed_files({s["audioPath"] for s in catalog["songs"]}, acb_duration, "hash-audio")
+    chart_bytes, chart_hashes = hashed_files({c["chartPath"] for s in catalog["songs"] for c in s["charts"]}, json.loads, "hash-chart")
     for song in catalog["songs"]:
         if song["coverPath"]:
             song["coverPath"] = cover_hashes[song["coverPath"]]
@@ -300,7 +320,10 @@ def build(source, overrides, output, workers=4):
         if target.exists() and target.read_bytes() != data:
             raise ValueError(f"Refusing to overwrite an immutable release: {path}")
         atomic_write(target, data)
-    parallel_map(write_payload, {**payloads, manifest_path: manifest_bytes}.items(), workers)
+    payloads_with_manifest = {**payloads, manifest_path: manifest_bytes}
+    def report_write(done, total, item):
+        log_progress(f"write {done}/{total} {item[0]}")
+    parallel_map(write_payload, payloads_with_manifest.items(), workers, progress=report_write)
     current = {"schemaVersion": 1, "resourceVersion": revision, "manifestPath": manifest_path, "manifestSha256": sha256(manifest_bytes)}
     summary = validate_release(output, current, workers)
     atomic_write(output / "rizline/current.json", json_bytes(current))
@@ -365,11 +388,14 @@ def validate_release(root, current=None, workers=4):
     current = read_json(root / "rizline/current.json") if current is None else current
     validate_current(current)
     manifest = validate_manifest(current, contained_path(root, current["manifestPath"]).read_bytes())
+    log_progress(f"verify {len(manifest['files'])} files")
     def verify_asset(asset):
         data = contained_path(root, asset["path"]).read_bytes()
         if len(data) != asset["size"] or sha256(data) != asset["sha256"]:
             raise ValueError(f"Resource integrity mismatch: {asset['path']}")
-    parallel_map(verify_asset, manifest["files"], workers)
+    def report(done, total, asset):
+        log_progress(f"verify {done}/{total} {asset['path']}")
+    parallel_map(verify_asset, manifest["files"], workers, progress=report)
     catalog = read_json(contained_path(root, manifest["catalogPath"]))
     summary = validate_catalog_release(catalog, manifest)
     return {"resourceVersion": current["resourceVersion"], "files": len(manifest["files"]), "bytes": sum(a["size"] for a in manifest["files"]), **summary}

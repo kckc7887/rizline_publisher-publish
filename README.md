@@ -51,22 +51,18 @@ API 端点、桶名和签名参数均已内置，不需要创建 Variables 或�
 
 ## 本地使用
 
-需要 Python 3.10+；当前实测 Python 3.13、UnityPy 1.10.18、PowerShell 7。Windows 自动使用 PowerShell 的系统网络链路；其它平台使用 Python urllib。所有命令在本项目目录执行。
+需要 Python 3.10+；当前实测 Python 3.13、UnityPy 1.10.18、PowerShell 7。Windows 自动使用 PowerShell 的系统网络链路；其它平台使用 Python urllib。没有 `.venv` 时脚本会使用 `py`。
 
 ```powershell
 Set-Location 'D:\Projects\rizline-resource-publisher'
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -X utf8 -m rizline_publisher import
-.\.venv\Scripts\python.exe -X utf8 -m rizline_publisher validate
-.\.venv\Scripts\python.exe -X utf8 -m rizline_publisher build
-.\.venv\Scripts\python.exe -X utf8 -m rizline_publisher validate --release
-.\.venv\Scripts\python.exe -X utf8 -m rizline_publisher publish
+$env:AWS_ACCESS_KEY_ID = '你的 Access Key'
+$env:AWS_SECRET_ACCESS_KEY = '你的 Secret Key'
+pwsh -File .\publish-local.ps1
 ```
 
-`publish` 默认只展示上传计划。`import` 初次需要下载当前版本的索引资源、全部谱面、封面和完整音频；后续复用按 URL 存储的本地缓存。完整 ACB 与官方谱面 JSON 进入发布目录；时长仍按 ACB 元数据核验，HIT/COMBO 仍按谱面 note 统计。导入默认 4 个并发，可用 `import --workers 2` 降低并发。中途失败可直接重试，旧曲库不会被部分结果替换。
+只看上传计划：`pwsh -File .\publish-local.ps1 -Plan`。已导入并构建、只需重新上传：`pwsh -File .\publish-local.ps1 -PublishOnly`。导入、构建、校验和实际上传的并发可用 `-ImportWorkers`、`-BuildWorkers`、`-UploadWorkers` 覆盖。进度写到 stderr，每完成一个并行任务打一行。
 
-已有依赖时可直接将上面的 `.\.venv\Scripts\python.exe` 换成 `py`。
+`publish` 默认只展示上传计划。`import` 初次需要下载当前版本的索引资源、全部谱面、封面和完整音频；后续复用按 URL 存储的本地缓存。完整 ACB 与官方谱面 JSON 进入发布目录；时长仍按 ACB 元数据核验，HIT/COMBO 仍按谱面 note 统计。导入默认 4 个并发。中途失败可直接重试，旧曲库不会被部分结果替换。
 
 ## 日常维护
 
@@ -117,9 +113,10 @@ py -m venv .venv
 ```powershell
 $env:AWS_ACCESS_KEY_ID = '你的 Access Key'
 $env:AWS_SECRET_ACCESS_KEY = '你的 Secret Key'
-.\.venv\Scripts\python.exe -X utf8 -m rizline_publisher publish
-.\.venv\Scripts\python.exe -X utf8 -m rizline_publisher publish --execute --workers 4
+pwsh -File .\publish-local.ps1
 ```
+
+只重新上传已构建产物时：`pwsh -File .\publish-local.ps1 -PublishOnly`。
 
 已有本机 AWS profile 时也可使用 `AWS_PROFILE`。不要把实际 KEY 写进项目文件。密钥需有目标桶的对象读取、写入、复制、删除及桶级 ListBucket 权限；工具不修改桶配置或对象 ACL。桶的匿名公开读取策略应由存储侧配置。
 
@@ -127,13 +124,13 @@ $env:AWS_SECRET_ACCESS_KEY = '你的 Secret Key'
 
 任意资源不同，或远端 manifest/catalog 缺失、损坏时，分配北京日期目录 `rizline/releases/YYYY-MM-DD/`（当天已是线上目录则用 `-2`、`-3`）。未变封面、音频和谱面在桶内 CopyObject 到新目录，新增和内容变化的文件从 GitHub 工作副本 PUT，清单里已经没有的文件不复制。目标日期前缀若存在但不是 current（失败残留）会先清空再复用。权限拒绝和网络错误会失败，不当成“资源不存在”。禁止直接改正在使用的线上目录。差量发布前先在 `rizline/publisher-checks/` 用小对象验证条件写入，再用一对探针键验证同桶 CopyObject；检查或探针清理失败时不写任何正式发布对象。清单一致时不运行探针。`build` 的确定性结果和原始 `dist/` 不改变，实际候选版本单独写入 `work/publication-release/`。相同清单时也会用已验证的远端元数据和相同的本地资源重建准确归档，不下载封面。
 
-发布阶段顺序固定为：并行 CopyObject 未变文件并 Head 核对大小、PUT 新增和变更并分别 GET 验证实际字节 → 上传并验证 manifest → 条件写入 current 并 GET 验证 → 清理 `rizline/releases/` 下不属于新 current 的对象。资源上传、解析、哈希和校验的独立任务并行执行；版本发现的前置依赖与发布阶段屏障保持顺序。单文件 PUT 对超时和断线做有限次重试。所有 PUT 附带 `Content-MD5`；资源和 manifest 使用 `If-None-Match: *`，current 使用起始读取的 ETag 做 `If-Match`，首次发布则使用 `If-None-Match: *`。409/412 冲突中止，不降级为无条件覆盖。不可变对象缓存一年，current 使用 `no-cache`。存储端必须实际支持这些标准条件和 CopyObject，参见 [S3 PutObject 文档](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html)。
+发布阶段顺序固定为：并行 CopyObject 未变文件并 Head 核对大小、PUT 新增和变更并分别 GET 验证实际字节 → 上传并验证 manifest → 条件写入 current 并 GET 验证 → 清理 `rizline/releases/` 下不属于新 current 的对象。资源上传、解析、哈希和校验的独立任务并行执行；版本发现的前置依赖与发布阶段屏障保持顺序。单文件 PUT 对超时和断线做有限次重试。所有 PUT 附带 `Content-MD5`；资源和 manifest 使用 `If-None-Match: *`，current 使用起始读取的 ETag 做 `If-Match`，首次发布则使用 `If-None-Match: *`。资源或 manifest 因对象已存在而 412 时，若 GET 校验字节一致则视为已上传（客户端超时后的重试或失败残留）；内容不一致仍中止。current 的 409/412 视为竞争失败，不降级为无条件覆盖。不可变对象缓存一年，current 使用 `no-cache`。存储端必须实际支持这些标准条件和 CopyObject，参见 [S3 PutObject 文档](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html)。
 
 玩家在漫长上传期间继续读取完整旧版，指针切换之前不删旧资源。切换成功后立即清理上传前记录的 **releases 残留**（含旧 live 和失败留下的目录）；其它前缀如 `other/` 不受影响。每批最多删除 1,000 个对象，删除前及最终完成前重查 current，并校验对象实际消失。批量删除在签名之前对 SDK 序列化的 XML 计算 `Content-MD5`。本事务不修改桶配置、ACL、版本控制或生命周期。
 
 采用立即清理策略后，仍持有旧曲库且未缓存封面的客户端可能需要刷新曲库；已经缓存的资源可继续离线使用。上传失败不切换；current 写入或回读失败时不开始清理，但网络异常可能使指针结果不确定，报告中 `currentSwitched: null` 表示未能确认。清理失败时新版仍可能已正常上线；重试只处理已记录的旧键，不重新上传。
 
-`work/publication-report.json` 在实际发布成功或失败时写入阶段、计数、准确版本和未完成删除键。每次差量发布的清理记录写入独立的 `work/cleanup-receipts/<实际发布版本>.json`，在 current 切换前落盘，不覆盖以前的记录。可先查看记录的清理计划，再显式执行：
+`work/publication-report.json` 在实际发布成功或失败时写入阶段、计数、准确版本和未完成删除键。每次差量发布的清理记录默认写入 `work/cleanup-receipts/<实际发布版本>.json`，在 current 切换前落盘；该文件已存在时改用 `<版本>.retry-2.json` 等新文件，不覆盖旧回执。可先查看记录的清理计划，再显式执行：
 
 ```powershell
 py -X utf8 -m rizline_publisher cleanup --receipt 'work/cleanup-receipts/实际发布版本.json'

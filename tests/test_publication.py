@@ -237,6 +237,19 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn(leftover, self.client.values)
         self.assertTrue(any(key.startswith("rizline/releases/2026-09-14/") for key in self.client.values))
 
+    def test_identical_resource_put_precondition_is_treated_as_already_uploaded(self):
+        self.client.race = "identical"
+        result = self.execute()
+        self.assertEqual(result["publication"]["status"], "published")
+        self.assertEqual(self.pointer()["resourceVersion"], "2026-09-14")
+
+    def test_conflicting_resource_put_precondition_still_fails_before_pointer(self):
+        self.client.race = "conflict"
+        with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+            self.execute()
+        self.assertNotIn(CURRENT, self.client.values)
+        self.assertEqual(self.report()["phase"], "upload-resources")
+
     def test_date_suffix_advances_only_for_the_same_beijing_day(self):
         self.assertEqual(next_date_name(None, "2026-09-14"), "2026-09-14")
         self.assertEqual(next_date_name("3.20.0-uuid", "2026-09-14"), "2026-09-14")
@@ -420,6 +433,29 @@ class PublicationTests(unittest.TestCase):
         self.assertIn(b"content-md5", request.headers["Authorization"].split(b"SignedHeaders=", 1)[1].split(b",", 1)[0].split(b";"))
         self.assertEqual([node.text for node in ElementTree.fromstring(request.body).findall("{*}Object/{*}Key")], [key])
 
+    def test_retry_publish_keeps_existing_receipt_and_uses_a_sibling_path(self):
+        self.seed_build()
+        self.update()
+        with patch.object(self.client, "put_object", side_effect=RuntimeError("upload interrupted")), self.assertRaisesRegex(RuntimeError, "upload interrupted"):
+            self.execute()
+        first = Path(self.report()["cleanupReceipt"])
+        self.assertEqual(first.name, "2026-09-14.json")
+        self.assertEqual(read_json(first)["status"], "prepared")
+        result = self.execute()
+        second = Path(result["publication"]["cleanupReceipt"])
+        self.assertEqual(second.name, "2026-09-14.retry-2.json")
+        self.assertTrue(first.exists())
+        self.assertNotEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(result["publication"]["status"], "published")
+        self.assertEqual(self.pointer()["resourceVersion"], "2026-09-14")
+
+    def test_explicit_cleanup_receipt_path_still_refuses_overwrite(self):
+        path = self.root / "work/cleanup-receipts/custom.json"
+        atomic_write(path, b"{}\n")
+        with self.assertRaisesRegex(RuntimeError, "Cleanup receipt already exists"):
+            self.execute(cleanup_receipt=path)
+        self.assertEqual(path.read_bytes(), b"{}\n")
+
 
 class WorkerTests(unittest.TestCase):
     def test_import_chart_statistics_run_in_parallel_and_failed_import_preserves_catalog(self):
@@ -481,6 +517,16 @@ class WorkerTests(unittest.TestCase):
             finally:
                 release.set()
             self.assertEqual(pending.result(timeout=5), [i * 2 for i in range(20)])
+
+    def test_parallel_map_reports_progress_for_each_completed_item(self):
+        seen = []
+        def progress(done, total, item):
+            seen.append((done, total, item))
+        self.assertEqual(parallel_map(lambda value: value * 2, [3, 1, 2], 2, progress=progress), [6, 2, 4])
+        self.assertEqual(len(seen), 3)
+        self.assertEqual({item for _, _, item in seen}, {1, 2, 3})
+        self.assertEqual({total for _, total, _ in seen}, {3})
+        self.assertEqual(seen[-1][0], 3)
 
     def test_build_and_validate_workers_reject_invalid_values(self):
         from rizline_publisher.upstream import import_catalog
