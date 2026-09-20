@@ -13,7 +13,7 @@ on:
       upload_workers:
         description: 资源上传与校验并发数
         type: choice
-        default: '4'
+        default: '16'
         options:
           - '4'
           - '8'
@@ -86,7 +86,7 @@ jobs:
           python -m rizline_publisher validate --release --workers "$PARSE_WORKERS"
       - name: 生成上传计划
         env:
-          UPLOAD_WORKERS: ${{ inputs.upload_workers || '4' }}
+          UPLOAD_WORKERS: ${{ inputs.upload_workers || '16' }}
         run: python -m rizline_publisher publish --workers "$UPLOAD_WORKERS" > work/upload-plan.json
       - name: 保存可发布资源
         id: release
@@ -132,7 +132,8 @@ jobs:
     name: 验证产物与按需发布
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Hosted runner is overseas; first audio/chart PUT+GET to Ningbo can exceed 90 minutes.
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -158,7 +159,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_EC2_METADATA_DISABLED: 'true'
-          UPLOAD_WORKERS: ${{ inputs.upload_workers || '4' }}
+          UPLOAD_WORKERS: ${{ inputs.upload_workers || '16' }}
         run: |
           set -o pipefail
           python - <<'PY'

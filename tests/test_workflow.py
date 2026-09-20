@@ -161,7 +161,7 @@ class WorkflowTests(unittest.TestCase):
     def test_schedule_workers_reach_both_commands_without_manual_inputs(self):
         publisher_steps = [step for step in self.build_steps + self.publish_steps if "rizline_publisher publish" in command(step)]
         self.assertEqual(len(publisher_steps), 2)
-        cases = [(context("schedule"), "4"), (context("workflow_dispatch", upload_workers=""), "4")]
+        cases = [(context("schedule"), "16"), (context("workflow_dispatch", upload_workers=""), "16")]
         cases.extend((context("workflow_dispatch", upload_workers=value), value) for value in ("1", "4", "8", "12", "16"))
         for step in publisher_steps:
             env = block(step, "env", 8)
@@ -173,7 +173,7 @@ class WorkflowTests(unittest.TestCase):
                     argv = shlex.split(run.replace("$UPLOAD_WORKERS", str(evaluate(expression, values))))
                     self.assertEqual(argv[argv.index("--workers") + 1], expected)
         inputs = block(block(block(self.workflow, "on", 0), "workflow_dispatch", 2), "inputs", 4)
-        self.assertEqual(scalar(block(inputs, "upload_workers", 6), "default", 8), "4")
+        self.assertEqual(scalar(block(inputs, "upload_workers", 6), "default", 8), "16")
         execute = block(inputs, "execute", 6)
         self.assertEqual(scalar(execute, "type", 8), "boolean")
         self.assertEqual(scalar(execute, "default", 8), "false")
