@@ -23,6 +23,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
+from .audio import acb_duration
 from .core import apply_overrides, atomic_write, check_workers, json_bytes, load_overrides, max_combo, parallel_map, sha256, supplement_template, validate_catalog
 
 CONFIG_URL = "https://rizserver.pigeongames.net/game/server_api/v1/dis"
@@ -291,15 +292,17 @@ class Importer:
                 return buffer.getvalue()
         raise ValueError("Unambiguous cover texture not found: " + key)
 
-    def duration(self, music_id):
-        from .audio import acb_duration
+    def acb(self, music_id):
         key = f"Assets/GameAssets/CRIAsset/{music_id}.acb"
         references = [value for value in self.addressables.bundles(key) if "/cridata_assets_criaddressables/" in value and ".acb=" in value]
         if len(references) != 1:
             raise ValueError("Unambiguous music ACB not found: " + music_id)
         path = references[0].split("/default/", 1)[1].removesuffix(".bundle")
         version = self.mapping.get(path, self.baseline)
-        return acb_duration(self.http.get(f"{self.base}/{version}/{path}"))
+        return self.http.get(f"{self.base}/{version}/{path}")
+
+    def duration(self, music_id):
+        return acb_duration(self.acb(music_id))
 
 
 def import_catalog(work, cache, overrides_path, transport="auto", workers=4, stats_url=STATS_URL, log=print):
@@ -321,7 +324,7 @@ def import_catalog(work, cache, overrides_path, transport="auto", workers=4, sta
     for level in official["levels"] + official["discOLevels"]:
         music, illustration = musics[level["musicId"]], illustrations[level["illustrationId"]]
         pack = level.get("discName") or "disc-o"
-        song = {"id": level["id"], "title": music["musicName"], "artist": music.get("artist") or None, "illustrator": illustration.get("artist") or None, "packId": pack, "packName": pack, "bpm": None, "durationSeconds": None, "updatedAt": None, "coverPath": None, "charts": [], "achievements": []}
+        song = {"id": level["id"], "title": music["musicName"], "artist": music.get("artist") or None, "illustrator": illustration.get("artist") or None, "packId": pack, "packName": pack, "bpm": None, "durationSeconds": None, "updatedAt": None, "coverPath": None, "audioPath": None, "charts": [], "achievements": []}
         cover_keys[song["id"]] = replacements.get(level["illustrationId"], level["illustrationId"])
         music_ids[song["id"]] = level["musicId"]
         for identity in level["chartIds"]:
@@ -330,7 +333,7 @@ def import_catalog(work, cache, overrides_path, transport="auto", workers=4, sta
             constant = None if difficulty == "SP" else round(raw["difficulty"], 1)
             label = str(level.get("difficultyText") or "SP") if difficulty == "SP" else str(int(constant)) + ("+" if round(constant * 10) % 10 >= 6 else "")
             designer = raw.get("designer") or None
-            chart = {"id": identity, "songId": song["id"], "difficulty": difficulty, "level": label, "constant": constant, "designer": labels.get(designer, designer), "hit": None, "combo": None, "maxScore": None, "riztimeHit": None}
+            chart = {"id": identity, "songId": song["id"], "difficulty": difficulty, "level": label, "constant": constant, "designer": labels.get(designer, designer), "hit": None, "combo": None, "maxScore": None, "riztimeHit": None, "chartPath": None}
             song["charts"].append(chart)
             jobs[identity] = chart
         songs.append(song)
@@ -340,8 +343,13 @@ def import_catalog(work, cache, overrides_path, transport="auto", workers=4, sta
     def retrieve(task):
         kind, key = task
         try:
-            data = chart_stats(json.loads(importer.text(replacements.get(key, key)))) if kind == "chart" else importer.cover(key) if kind == "cover" else importer.duration(key)
-            return task, data, None
+            if kind == "chart":
+                raw = importer.text(replacements.get(key, key))
+                return task, (chart_stats(json.loads(raw)), raw), None
+            if kind == "cover":
+                return task, importer.cover(key), None
+            data = importer.acb(key)
+            return task, (acb_duration(data), data), None
         except Exception as error:
             return task, None, {"kind": kind, "id": key, "error": str(error)}
 
@@ -365,7 +373,7 @@ def import_catalog(work, cache, overrides_path, transport="auto", workers=4, sta
         matches = by_title.get(normalize_title(match_name), [])
         row = matches[0] if len(matches) == 1 else None
         for chart in song["charts"]:
-            values, bpm = results[("chart", chart["id"])]
+            (values, bpm), raw = results[("chart", chart["id"])]
             chart.update(values)
             bpms.update(bpm)
             verified = verified_stats(row, chart)
@@ -373,9 +381,16 @@ def import_catalog(work, cache, overrides_path, transport="auto", workers=4, sta
                 chart.update(verified)
             elif chart["difficulty"] != "SP":
                 unresolved_stats.append({"songId": song["id"], "title": song["title"], "chartId": chart["id"], "difficulty": chart["difficulty"], "hit": chart["hit"], "matchedStatistics": row["name"] if row else None, "reason": "no-title-match" if not matches else "ambiguous-title-match" if len(matches) > 1 else "missing-or-incompatible-chart-statistics", "statisticsCandidates": [{"name": candidate["name"], "chart": candidate.get(chart["difficulty"])} for candidate in matches]})
+            path = f"charts/{sha256(raw)}.json"
+            atomic_write(work / path, raw)
+            chart["chartPath"] = path
         minimum, maximum = min(bpms), max(bpms)
         song["bpm"] = f"{minimum:g}" if minimum == maximum else f"{minimum:g}–{maximum:g}"
-        song["durationSeconds"] = results[("audio", music_ids[song["id"]])]
+        duration, audio = results[("audio", music_ids[song["id"]])]
+        song["durationSeconds"] = duration
+        audio_path = f"audio/{sha256(audio)}.acb"
+        atomic_write(work / audio_path, audio)
+        song["audioPath"] = audio_path
         cover = results[("cover", cover_keys[song["id"]])]
         path = f"covers/{sha256(cover)}.png"
         atomic_write(work / path, cover)

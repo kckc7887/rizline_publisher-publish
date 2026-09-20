@@ -16,8 +16,8 @@ S3_ENDPOINT = "https://cn-nb1.rains3.com"
 # The bucket's GetBucketLocation returns an empty LocationConstraint (us-east-1).
 S3_REGION = "us-east-1"
 DIFFICULTIES = ("EZ", "HD", "IN", "AT", "SP")
-SONG_FIELDS = {"id", "title", "artist", "illustrator", "packId", "packName", "bpm", "durationSeconds", "updatedAt", "coverPath", "charts", "achievements"}
-CHART_FIELDS = {"id", "songId", "difficulty", "level", "constant", "designer", "hit", "combo", "maxScore", "riztimeHit"}
+SONG_FIELDS = {"id", "title", "artist", "illustrator", "packId", "packName", "bpm", "durationSeconds", "updatedAt", "coverPath", "audioPath", "charts", "achievements"}
+CHART_FIELDS = {"id", "songId", "difficulty", "level", "constant", "designer", "hit", "combo", "maxScore", "riztimeHit", "chartPath"}
 
 
 def json_bytes(value):
@@ -149,6 +149,8 @@ def validate_catalog(catalog):
             date.fromisoformat(song["updatedAt"])
         if song["coverPath"] is not None:
             relative_path(song["coverPath"])
+        string(song["audioPath"], "audioPath")
+        relative_path(song["audioPath"])
         if not isinstance(song["charts"], list) or not song["charts"]:
             raise ValueError(f"Song has no charts: {song['id']}")
         kinds = set()
@@ -156,6 +158,8 @@ def validate_catalog(catalog):
             if set(chart) != CHART_FIELDS:
                 raise ValueError(f"Unexpected/missing chart fields: {chart.get('id')}")
             string(chart["id"], "chart id")
+            string(chart["chartPath"], "chartPath")
+            relative_path(chart["chartPath"])
             if chart["id"] in chart_ids or chart["songId"] != song["id"]:
                 raise ValueError(f"Duplicate/mislinked chart: {chart['id']}")
             chart_ids.add(chart["id"])
@@ -187,7 +191,7 @@ def validate_catalog(catalog):
             if achievement["id"] in achievement_ids:
                 raise ValueError("Duplicate song achievement")
             achievement_ids.add(achievement["id"])
-    return {"songs": len(song_ids), "charts": len(chart_ids), "covers": sum(s["coverPath"] is not None for s in catalog["songs"]), "missingUpdateDates": sum(s["updatedAt"] is None for s in catalog["songs"]), "missingDurations": sum(s["durationSeconds"] is None for s in catalog["songs"]), "missingMaxScores": sum(c["maxScore"] is None for s in catalog["songs"] for c in s["charts"])}
+    return {"songs": len(song_ids), "charts": len(chart_ids), "covers": sum(s["coverPath"] is not None for s in catalog["songs"]), "audios": len({s["audioPath"] for s in catalog["songs"]}), "chartFiles": len({c["chartPath"] for s in catalog["songs"] for c in s["charts"]}), "missingUpdateDates": sum(s["updatedAt"] is None for s in catalog["songs"]), "missingDurations": sum(s["durationSeconds"] is None for s in catalog["songs"]), "missingMaxScores": sum(c["maxScore"] is None for s in catalog["songs"] for c in s["charts"])}
 
 
 def max_combo(hit):
@@ -217,7 +221,7 @@ def apply_overrides(catalog, overrides):
     result = copy.deepcopy(catalog)
     songs = {s["id"]: s for s in result["songs"]}
     charts = {c["id"]: c for s in result["songs"] for c in s["charts"]}
-    for kind, items, allowed in (("songs", songs, SONG_FIELDS - {"id", "charts", "coverPath"}), ("charts", charts, CHART_FIELDS - {"id", "songId", "difficulty"})):
+    for kind, items, allowed in (("songs", songs, SONG_FIELDS - {"id", "charts", "coverPath", "audioPath"}), ("charts", charts, CHART_FIELDS - {"id", "songId", "difficulty", "chartPath"})):
         for identity, patch in overrides[kind].items():
             if identity not in items:
                 raise ValueError(f"Unknown override {kind} id: {identity}")
@@ -247,17 +251,26 @@ def build(source, overrides, output, workers=4):
     source, output = Path(source), Path(output)
     catalog = apply_overrides(read_json(source), load_overrides(overrides))
     atomic_write(source.parent / "supplement-template.json", json_bytes(supplement_template(catalog)))
-    def read_cover(path):
-        data = contained_path(source.parent, path).read_bytes()
+    from .audio import acb_duration
+    def hashed_files(paths, verify):
+        def read(path):
+            data = contained_path(source.parent, path).read_bytes()
+            verify(data)
+            return path, sha256(data), data
+        items = parallel_map(read, sorted(paths), workers) if paths else []
+        return {digest: data for _, digest, data in items}, {path: digest for path, digest, _ in items}
+    def verify_png(data):
         if not data.startswith(b"\x89PNG\r\n\x1a\n"):
             raise ValueError("Imported covers must be PNG images")
-        return path, sha256(data), data
-    covers = parallel_map(read_cover, sorted({s["coverPath"] for s in catalog["songs"] if s["coverPath"]}), workers)
-    cover_bytes = {digest: data for _, digest, data in covers}
-    cover_hashes = {path: digest for path, digest, _ in covers}
+    cover_bytes, cover_hashes = hashed_files({s["coverPath"] for s in catalog["songs"] if s["coverPath"]}, verify_png)
+    audio_bytes, audio_hashes = hashed_files({s["audioPath"] for s in catalog["songs"]}, acb_duration)
+    chart_bytes, chart_hashes = hashed_files({c["chartPath"] for s in catalog["songs"] for c in s["charts"]}, json.loads)
     for song in catalog["songs"]:
         if song["coverPath"]:
             song["coverPath"] = cover_hashes[song["coverPath"]]
+        song["audioPath"] = audio_hashes[song["audioPath"]]
+        for chart in song["charts"]:
+            chart["chartPath"] = chart_hashes[chart["chartPath"]]
     fingerprint = sha256(json_bytes(catalog))[:16]
     official_version = re.sub(r"[^a-zA-Z0-9_.-]", "_", catalog["resourceVersion"])
     revision = f"{official_version}-{fingerprint}"
@@ -269,6 +282,13 @@ def build(source, overrides, output, workers=4):
             digest = song["coverPath"]
             song["coverPath"] = f"{prefix}/covers/{digest}.png"
             payloads[song["coverPath"]] = cover_bytes[digest]
+        digest = song["audioPath"]
+        song["audioPath"] = f"{prefix}/audio/{digest}.acb"
+        payloads[song["audioPath"]] = audio_bytes[digest]
+        for chart in song["charts"]:
+            digest = chart["chartPath"]
+            chart["chartPath"] = f"{prefix}/charts/{digest}.json"
+            payloads[chart["chartPath"]] = chart_bytes[digest]
     catalog_path = f"{prefix}/catalog.json"
     payloads[catalog_path] = json_bytes(catalog)
     manifest = {"schemaVersion": 1, "resourceVersion": revision, "gameVersion": catalog["gameVersion"], "files": [{"path": path, "size": len(data), "sha256": sha256(data)} for path, data in sorted(payloads.items())], "catalogPath": catalog_path}
@@ -331,6 +351,11 @@ def validate_catalog_release(catalog, manifest):
     for song in catalog["songs"]:
         if song["coverPath"] and song["coverPath"] not in paths:
             raise ValueError("Cover is not in the manifest")
+        if song["audioPath"] not in paths:
+            raise ValueError("Audio is not in the manifest")
+        for chart in song["charts"]:
+            if chart["chartPath"] not in paths:
+                raise ValueError("Chart is not in the manifest")
     return summary
 
 

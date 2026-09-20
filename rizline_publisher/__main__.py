@@ -15,7 +15,7 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, default=Path("dist"))
     parser.add_argument("--overrides", type=Path, default=Path("overrides.json"))
     sub = parser.add_subparsers(dest="command", required=True)
-    importer = sub.add_parser("import", help="Import the complete current official catalog/covers")
+    importer = sub.add_parser("import", help="Import the complete current official catalog, covers, charts and audio")
     importer.add_argument("--transport", choices=("auto", "urllib", "powershell"), default="auto")
     importer.add_argument("--workers", type=int, choices=range(1, 9), default=4)
     importer.add_argument("--stats-url", default=STATS_URL, help="Pinned statistics source; empty string disables enrichment")

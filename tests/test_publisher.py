@@ -22,12 +22,48 @@ from rizline_publisher.audio import acb_duration, utf_rows
 
 
 def fixture():
-    song = {"id": "Song.artist.0", "title": "Song", "artist": "Artist", "illustrator": None, "packId": "Disc 1", "packName": "Disc 1", "bpm": "150", "durationSeconds": None, "updatedAt": None, "coverPath": "covers/test.png", "charts": [{"id": "chart.Song.artist.0.IN", "songId": "Song.artist.0", "difficulty": "IN", "level": "12+", "constant": 12.6, "designer": "Designer", "hit": 20, "combo": 56, "maxScore": 1001000, "riztimeHit": 10}], "achievements": []}
+    song = {"id": "Song.artist.0", "title": "Song", "artist": "Artist", "illustrator": None, "packId": "Disc 1", "packName": "Disc 1", "bpm": "150", "durationSeconds": None, "updatedAt": None, "coverPath": "covers/test.png", "audioPath": "audio/test.acb", "charts": [{"id": "chart.Song.artist.0.IN", "songId": "Song.artist.0", "difficulty": "IN", "level": "12+", "constant": 12.6, "designer": "Designer", "hit": 20, "combo": 56, "maxScore": 1001000, "riztimeHit": 10, "chartPath": "charts/test.json"}], "achievements": []}
     return {"schemaVersion": 1, "resourceVersion": "v141_example", "gameVersion": "2.7.1", "songs": [song]}
 
 
 def overrides():
     return {"schemaVersion": 1, "songs": {}, "charts": {}, "statAliases": {}, "achievementSongs": {}}
+
+
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aH9sAAAAASUVORK5CYII=")
+CHART_JSON = json_bytes({"bPM": 150, "lines": []})
+
+
+def cri_utf_table(fields):
+    strings, binary, schema, row = b"Header\0", b"", b"", b""
+    for name, value in fields.items():
+        name_offset = len(strings)
+        strings += name.encode() + b"\0"
+        kind = 11 if isinstance(value, bytes) else 4
+        schema += bytes([0x50 | kind]) + struct.pack(">I", name_offset)
+        if kind == 11:
+            row += struct.pack(">II", len(binary), len(value))
+            binary += value
+        else:
+            row += struct.pack(">I", value)
+    rows_at = 32 + len(schema)
+    strings_at = rows_at + len(row)
+    binary_at = strings_at + len(strings)
+    size = binary_at + len(binary)
+    header = b"@UTF" + struct.pack(">IHHIIIHHI", size - 8, 1, rows_at - 8, strings_at - 8, binary_at - 8, 0, len(fields), len(row), 1)
+    return header + schema + row + strings + binary
+
+
+def sample_acb(samples=1720):
+    hca = b"HCA\0" + struct.pack(">HH", 0x300, 32) + b"fmt\0" + b"\2" + (44100).to_bytes(3, "big") + struct.pack(">IHH", 2, 128, 200) + b"comp" + struct.pack(">H", 10) + b"\0\0" + bytes(20)
+    bank = b"AFS2" + bytes([2, 4]) + struct.pack("<HIHH", 4, 1, 32, 0) + struct.pack("<III", 0, 28, 32 + len(hca)) + bytes(4) + hca
+    return cri_utf_table({"WaveformTable": cri_utf_table({"NumSamples": samples, "SamplingRate": 44100}), "AwbFile": bank})
+
+
+def write_fixture_assets(root):
+    atomic_write(root / "covers/test.png", PNG)
+    atomic_write(root / "audio/test.acb", sample_acb())
+    atomic_write(root / "charts/test.json", CHART_JSON)
 
 
 class MemoryS3:
@@ -131,8 +167,8 @@ class PublisherTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.source, self.override, self.output = self.root / "work/catalog.json", self.root / "overrides.json", self.root / "dist"
         atomic_write(self.source, json_bytes(fixture()))
-        # Valid small PNG; fixture content is local and no network is needed for tests.
-        atomic_write(self.source.parent / "covers/test.png", base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aH9sAAAAASUVORK5CYII="))
+        # Local PNG/ACB/JSON fixtures; no network is needed for tests.
+        write_fixture_assets(self.source.parent)
         atomic_write(self.override, json_bytes(overrides()))
 
     def tearDown(self):
@@ -154,6 +190,15 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(pointer, (self.output / "rizline/current.json").read_bytes())
         self.assertEqual(before, (self.override.read_bytes(), self.source.read_bytes()))
         self.assertEqual(first["missingUpdateDates"], 0)
+        current = read_json(self.output / "rizline/current.json")
+        manifest = read_json(self.output / current["manifestPath"])
+        catalog = read_json(self.output / manifest["catalogPath"])
+        paths = {asset["path"] for asset in manifest["files"]}
+        song = catalog["songs"][0]
+        self.assertTrue(song["audioPath"].endswith(".acb") and song["audioPath"] in paths)
+        self.assertTrue(song["charts"][0]["chartPath"].endswith(".json") and song["charts"][0]["chartPath"] in paths)
+        self.assertEqual((self.output / song["audioPath"]).read_bytes(), sample_acb())
+        self.assertEqual((self.output / song["charts"][0]["chartPath"]).read_bytes(), CHART_JSON)
         template = read_json(self.source.parent / "supplement-template.json")
         self.assertNotIn("updatedAt", template["songs"]["Song.artist.0"])
 
@@ -225,6 +270,14 @@ class PublisherTests(unittest.TestCase):
         value["songs"]["typo"] = {"title": "Edited"}
         with self.assertRaisesRegex(ValueError, "Unknown override"):
             apply_overrides(fixture(), value)
+
+    def test_audio_and_chart_paths_cannot_be_overridden(self):
+        songs, charts = overrides(), overrides()
+        songs["songs"]["Song.artist.0"] = {"audioPath": "audio/other.acb"}
+        charts["charts"]["chart.Song.artist.0.IN"] = {"chartPath": "charts/other.json"}
+        for value in (songs, charts):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Unsupported override"):
+                apply_overrides(fixture(), value)
 
     def test_dry_run_needs_no_configuration_or_credentials(self):
         build(self.source, self.override, self.output)
@@ -315,30 +368,8 @@ class ImportTests(unittest.TestCase):
 
 
 class AudioTests(unittest.TestCase):
-    @staticmethod
-    def table(fields):
-        strings, binary, schema, row = b"Header\0", b"", b"", b""
-        for name, value in fields.items():
-            name_offset = len(strings)
-            strings += name.encode() + b"\0"
-            kind = 11 if isinstance(value, bytes) else 4
-            schema += bytes([0x50 | kind]) + struct.pack(">I", name_offset)
-            if kind == 11:
-                row += struct.pack(">II", len(binary), len(value))
-                binary += value
-            else:
-                row += struct.pack(">I", value)
-        rows_at = 32 + len(schema)
-        strings_at = rows_at + len(row)
-        binary_at = strings_at + len(strings)
-        size = binary_at + len(binary)
-        header = b"@UTF" + struct.pack(">IHHIIIHHI", size - 8, 1, rows_at - 8, strings_at - 8, binary_at - 8, 0, len(fields), len(row), 1)
-        return header + schema + row + strings + binary
-
     def audio(self, samples=1720):
-        hca = b"HCA\0" + struct.pack(">HH", 0x300, 32) + b"fmt\0" + b"\2" + (44100).to_bytes(3, "big") + struct.pack(">IHH", 2, 128, 200) + b"comp" + struct.pack(">H", 10) + b"\0\0" + bytes(20)
-        bank = b"AFS2" + bytes([2, 4]) + struct.pack("<HIHH", 4, 1, 32, 0) + struct.pack("<III", 0, 28, 32 + len(hca)) + bytes(4) + hca
-        return self.table({"WaveformTable": self.table({"NumSamples": samples, "SamplingRate": 44100}), "AwbFile": bank})
+        return sample_acb(samples)
 
     def test_duration_uses_real_samples_excluding_codec_padding(self):
         self.assertAlmostEqual(acb_duration(self.audio()), 1720 / 44100, places=6)

@@ -167,14 +167,22 @@ def _delete_objects_content_md5(request, **kwargs):
     request.headers["Content-MD5"] = base64.b64encode(hashlib.md5(request.body, usedforsecurity=False).digest()).decode("ascii")
 
 
+def rebase_resource(value, old_prefix, new_prefix, label):
+    if value is None:
+        return None
+    if not value.startswith(old_prefix):
+        raise ValueError(f"{label} is outside its release")
+    return new_prefix + value[len(old_prefix):]
+
+
 def move_catalog(catalog, old_prefix, new_prefix, revision):
     result = copy.deepcopy(catalog)
     result["resourceVersion"] = revision
     for song in result["songs"]:
-        if song["coverPath"]:
-            if not song["coverPath"].startswith(old_prefix):
-                raise ValueError("Cover is outside its release")
-            song["coverPath"] = new_prefix + song["coverPath"][len(old_prefix):]
+        song["coverPath"] = rebase_resource(song["coverPath"], old_prefix, new_prefix, "Cover")
+        song["audioPath"] = rebase_resource(song["audioPath"], old_prefix, new_prefix, "Audio")
+        for chart in song["charts"]:
+            chart["chartPath"] = rebase_resource(chart["chartPath"], old_prefix, new_prefix, "Chart")
     return result
 
 
@@ -340,9 +348,17 @@ def retry_cleanup(receipt_path, execute=False, endpoint=None, region=None):
     return result
 
 
+def object_content_type(path):
+    if path.endswith(".png"):
+        return "image/png"
+    if path.endswith(".json"):
+        return "application/json; charset=utf-8"
+    return "application/octet-stream"
+
+
 def put_verified(client, path, data, *, etag=None):
     request = {"Bucket": BUCKET, "Key": path, "Body": data,
-               "ContentType": "image/png" if path.endswith(".png") else "application/json; charset=utf-8",
+               "ContentType": object_content_type(path),
                "CacheControl": "no-cache" if path == CURRENT else "public, max-age=31536000, immutable",
                "Metadata": {"sha256": sha256(data)},
                "ContentMD5": base64.b64encode(hashlib.md5(data, usedforsecurity=False).digest()).decode("ascii")}

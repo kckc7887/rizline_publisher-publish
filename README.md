@@ -6,6 +6,12 @@
 
 第三方代码来源、直接 Python 依赖的许可证及引用边界见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。音频格式参考代码的完整上游许可保存在 [LICENSES/vgmstream-COPYING.txt](LICENSES/vgmstream-COPYING.txt)，各许可仅适用于对应第三方代码。
 
+## 致谢
+
+- [vgmstream](https://github.com/vgmstream/vgmstream)——CRI UTF、AFS2 与 HCA 格式实现参考
+- [rizline-tool](https://github.com/limmy114/rizline-tool)——首版 Riztime HIT 数据补充来源
+- [rizline-assets-get](https://github.com/CHCAT1320/rizline-assets-get)——Rizline 资源结构调查参考
+
 ## GitHub Actions
 
 仓库：<https://github.com/kckc7887/rizline_publisher-publish>。工作流分为两条：
@@ -32,8 +38,8 @@ API 端点、桶名和签名参数均已内置，不需要创建 Variables 或�
 
 1. 在 **Actions → 构建与发布曲库 → Run workflow** 选择 `main`。首次可保持实际上传不勾选，生成资源检查报告。
 2. `upload_workers` 默认 `4`，可选择 `1 / 4 / 8 / 12 / 16`；`parse_workers` 默认 `4`，可选择 `1 / 2 / 4 / 8`。定时运行两者均为 `4`。解析、构建与本地校验复用有界工作池；每次实际上传及远端 GET 校验也并行执行，排队任务最多为工作线程数的两倍。
-3. `rizline-release-<运行ID>-<尝试次数>` 是确定性构建包，`rizline-reports-<运行ID>-<尝试次数>` 是导入报告。实际发布另存 `rizline-publication-<运行ID>-<尝试次数>`，包含真正选中的发布版本；`rizline-publication-report-<运行ID>-<尝试次数>` 包含成功或失败阶段、指针结果及精确清理重试记录。失败候选包不代表已上线，以报告为准。产物均保留 90 天，不包含原始音频、谱面或 HTTP 缓存。
-4. 两个 KEY 配置完成后，每天会自动实际发布；需要立即运行时，勾选实际上传。已有 `manifest.json` 就是唯一资源清单：游戏版本和文件身份（相对路径、大小、SHA-256）一致时跳过上传；对不上时按北京日期开新目录，未变封面 CopyObject，只 PUT 新增和变更，再条件切换 current。切换成功后删除 `rizline/releases/` 下不属于新 current 的对象。
+3. `rizline-release-<运行ID>-<尝试次数>` 是确定性构建包，`rizline-reports-<运行ID>-<尝试次数>` 是导入报告。实际发布另存 `rizline-publication-<运行ID>-<尝试次数>`，包含真正选中的发布版本；`rizline-publication-report-<运行ID>-<尝试次数>` 包含成功或失败阶段、指针结果及精确清理重试记录。失败候选包不代表已上线，以报告为准。产物均保留 90 天，发布包含封面、完整 ACB 与官方谱面 JSON；不含 HTTP 缓存。
+4. 两个 KEY 配置完成后，每天会自动实际发布；需要立即运行时，勾选实际上传。已有 `manifest.json` 就是唯一资源清单：游戏版本和文件身份（相对路径、大小、SHA-256）一致时跳过上传；对不上时按北京日期开新目录，未变资源 CopyObject，只 PUT 新增和变更，再条件切换 current。切换成功后删除 `rizline/releases/` 下不属于新 current 的对象。
 
 多次发布工作流通过同一 concurrency group 串行执行，不取消正在发布的运行；资源文件在每次运行内部并行处理。上传失败时取消排队任务并等待在途任务结束，后续 manifest/current 阶段不执行。本地 CLI 复用相同事务；独立发布者同时运行时，current 的 ETag 条件写入阻止旧运行覆盖新指针。
 
@@ -58,7 +64,7 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -X utf8 -m rizline_publisher publish
 ```
 
-`publish` 默认只展示上传计划。`import` 初次需要下载当前版本的索引资源、全部谱面、封面和完整音频；后续复用按 URL 存储的本地缓存。音频只用来读取完整时长，不进入发布目录。导入默认 4 个并发，可用 `import --workers 2` 降低并发。中途失败可直接重试，旧曲库不会被部分结果替换。
+`publish` 默认只展示上传计划。`import` 初次需要下载当前版本的索引资源、全部谱面、封面和完整音频；后续复用按 URL 存储的本地缓存。完整 ACB 与官方谱面 JSON 进入发布目录；时长仍按 ACB 元数据核验，HIT/COMBO 仍按谱面 note 统计。导入默认 4 个并发，可用 `import --workers 2` 降低并发。中途失败可直接重试，旧曲库不会被部分结果替换。
 
 已有依赖时可直接将上面的 `.\.venv\Scripts\python.exe` 换成 `py`。
 
@@ -93,8 +99,8 @@ py -m venv .venv
 
 以上日期仅用于说明格式，不代表该歌曲真实更新时间。修改现有文件时保留其中已经审阅过的 `statAliases` 和 `achievementSongs`，不要用示例整体覆盖。
 
-- `songs` 支持歌曲元数据及完整 `achievements` 数组修订，禁止更改身份、封面路径或直接改写谱面列表。
-- `charts` 支持定数、等级、谱师及物量修订，禁止改写 ID、所属歌曲或难度类型。HIT/COMBO、Max Score/Riztime HIT 必须自洽；SP 定数始终为 `null`。
+- `songs` 支持歌曲元数据及完整 `achievements` 数组修订，禁止更改身份、封面路径、音频路径或直接改写谱面列表。
+- `charts` 支持定数、等级、谱师及物量修订，禁止改写 ID、所属歌曲、难度类型或谱面路径。HIT/COMBO、Max Score/Riztime HIT 必须自洽；SP 定数始终为 `null`。
 - `statAliases` 为“官方歌曲 ID → 统计源曲名”。只在逐谱面 HIT 完全相等时使用统计源的 Riztime HIT；没有匹配或物量变动时留空，不外推。
 - `achievementSongs` 为“官方成就本地化 ID → 官方歌曲 ID 数组”。当前源的成就 ID 带方括号，例如 `[dot_line]`，保留实际标识。空数组表示不关联任何歌曲。歌曲 `achievements` 中仅有 `id/title/condition`，不涉及玩家解锁状态。
 
@@ -119,7 +125,7 @@ $env:AWS_SECRET_ACCESS_KEY = '你的 Secret Key'
 
 实际上传前并行校验本地产物的 SHA-256 与大小。发布器读取 S3 的 current、manifest 和 catalog，先检查每一级实际字节的哈希与合同。对照只看游戏版本和每个资源的相对路径、大小、SHA-256；不比较 `generatedAt` / `publishedAt` / 随机修订号。曲库业务字段必须一致。完全一致时不执行任何资源 PUT 或 CopyObject，也不 GET 封面来重复算哈希，不改 current，不做清理。manifest 已满足资源清单需求，不生成第二份清单。
 
-任意资源不同，或远端 manifest/catalog 缺失、损坏时，分配北京日期目录 `rizline/releases/YYYY-MM-DD/`（当天已是线上目录则用 `-2`、`-3`）。未变封面在桶内 CopyObject 到新目录，新增和内容变化的文件从 GitHub 工作副本 PUT，清单里已经没有的文件不复制。目标日期前缀若存在但不是 current（失败残留）会先清空再复用。权限拒绝和网络错误会失败，不当成“资源不存在”。禁止直接改正在使用的线上目录。差量发布前先在 `rizline/publisher-checks/` 用小对象验证条件写入，再用一对探针键验证同桶 CopyObject；检查或探针清理失败时不写任何正式发布对象。清单一致时不运行探针。`build` 的确定性结果和原始 `dist/` 不改变，实际候选版本单独写入 `work/publication-release/`。相同清单时也会用已验证的远端元数据和相同的本地资源重建准确归档，不下载封面。
+任意资源不同，或远端 manifest/catalog 缺失、损坏时，分配北京日期目录 `rizline/releases/YYYY-MM-DD/`（当天已是线上目录则用 `-2`、`-3`）。未变封面、音频和谱面在桶内 CopyObject 到新目录，新增和内容变化的文件从 GitHub 工作副本 PUT，清单里已经没有的文件不复制。目标日期前缀若存在但不是 current（失败残留）会先清空再复用。权限拒绝和网络错误会失败，不当成“资源不存在”。禁止直接改正在使用的线上目录。差量发布前先在 `rizline/publisher-checks/` 用小对象验证条件写入，再用一对探针键验证同桶 CopyObject；检查或探针清理失败时不写任何正式发布对象。清单一致时不运行探针。`build` 的确定性结果和原始 `dist/` 不改变，实际候选版本单独写入 `work/publication-release/`。相同清单时也会用已验证的远端元数据和相同的本地资源重建准确归档，不下载封面。
 
 发布阶段顺序固定为：并行 CopyObject 未变文件并 Head 核对大小、PUT 新增和变更并分别 GET 验证实际字节 → 上传并验证 manifest → 条件写入 current 并 GET 验证 → 清理 `rizline/releases/` 下不属于新 current 的对象。资源上传、解析、哈希和校验的独立任务并行执行；版本发现的前置依赖与发布阶段屏障保持顺序。单文件 PUT 对超时和断线做有限次重试。所有 PUT 附带 `Content-MD5`；资源和 manifest 使用 `If-None-Match: *`，current 使用起始读取的 ETag 做 `If-Match`，首次发布则使用 `If-None-Match: *`。409/412 冲突中止，不降级为无条件覆盖。不可变对象缓存一年，current 使用 `no-cache`。存储端必须实际支持这些标准条件和 CopyObject，参见 [S3 PutObject 文档](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html)。
 
@@ -160,7 +166,7 @@ Get-ChildItem -LiteralPath '.\dist\rizline\releases' -Directory | Select-Object 
 - 完整时长来自官方 ACB 的 `WaveformTable.NumSamples / SamplingRate`，并与其内嵌完整 HCA 帧数、编码延迟及尾部填充交叉核验。不使用歌曲试听片段或谱面最后一个音符估算时长。格式实现参考 [CRI UTF](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/util/cri_utf.c)、[AFS2](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/meta/awb.c) 和 [HCA 元数据](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/coding/libs/clhca.c)，来源角色、核验快照与许可见 [第三方代码声明](THIRD_PARTY_NOTICES.md#vgmstream-格式实现参考)。仅读取格式元数据，无需解密或解码音频。
 - 相关成就的名称和条件来自官方简体中文本地化，去除显示用富文本标签。只关联条件中明确涉及的歌曲；通用成就和整个 Disc 的完成成就不散发到每首歌。普通歌曲成就不会因为同名自动附加到 SP。
 - `updatedAt` 专指游戏中歌曲/谱面的最近一次更新日期，格式 `YYYY-MM-DD`。官方资源表没有逐曲日期，所以初始值为空，待结合官方公告/Wiki 真实更新事件人工填写。HTTP Last-Modified、Wiki 编辑时间、导入时间均不替代这个字段。
-- 游戏美术、音乐和相关署名归原权利人所有；本项目只发布曲库元数据与展示封面，音频和谱面原文件不随发布产物上传。
+- 游戏美术、音乐和相关署名归原权利人所有；本项目发布曲库元数据、展示封面、完整官方 ACB 与官方谱面 JSON。时长仍只读取 ACB 公开元数据，不解密或解码音频。
 
 ## 输出合同与项目结构
 
@@ -172,13 +178,15 @@ dist/
   rizline/releases/<resourceVersion>/manifest.json
   rizline/releases/<resourceVersion>/catalog.json
   rizline/releases/<resourceVersion>/covers/<sha256>.png
+  rizline/releases/<resourceVersion>/audio/<sha256>.acb
+  rizline/releases/<resourceVersion>/charts/<sha256>.json
 ```
 
-`current.json` 包含 `schemaVersion/resourceVersion/manifestPath/manifestSha256`；manifest 包含 `schemaVersion/resourceVersion/gameVersion/files/catalogPath`，每个文件含 `path/size/sha256`。catalog 包含 `schemaVersion/resourceVersion/gameVersion/songs`，其中封面是当前不可变版本内的相对路径。
+`current.json` 包含 `schemaVersion/resourceVersion/manifestPath/manifestSha256`；manifest 包含 `schemaVersion/resourceVersion/gameVersion/files/catalogPath`，每个文件含 `path/size/sha256`。catalog 包含 `schemaVersion/resourceVersion/gameVersion/songs`，其中封面、音频、谱面都是当前不可变版本内的相对路径。
 
-构建版本由官方资源版本与最终元数据/封面摘要共同决定。同样的输入产生同样的版本；任何人工修订或封面内容变化都会产生新版本。先写完整版本，再原子替换本地 current。
+构建版本由官方资源版本与最终元数据/封面/音频/谱面摘要共同决定。同样的输入产生同样的版本；任何人工修订或资源内容变化都会产生新版本。先写完整版本，再原子替换本地 current。
 
-这里的相同输入指最终元数据与 PNG 文件字节相同。不同平台的 PNG 编码字节可能不同，即使封面像素一致，跨平台导入也可能生成不同的资源版本号。需要重发同一准确版本时，直接复用已归档的发布产物。
+这里的相同输入指最终元数据与 PNG、ACB、谱面 JSON 文件字节相同。不同平台的 PNG 编码字节可能不同，即使封面像素一致，跨平台导入也可能生成不同的资源版本号。需要重发同一准确版本时，直接复用已归档的发布产物。
 
 | 路径 | 职责 |
 | --- | --- |
@@ -203,7 +211,7 @@ dist/
 
 当前初始输入为官方 `2.7.1 / v141_2_7_1_3c13bbff2bP`：148 个独立歌曲条目、438 张谱面、145 张不同封面。全部歌曲已有完整音频时长、BPM、曲师和画师；全部谱面已有谱师、HIT 和 COMBO。435 张普通谱面有 Max Score 和 Riztime HIT，3 张 SP 的这两个字段为空。相关成就共 28 处歌曲关联。
 
-148 个游戏更新时间仍为空，等待真实游戏更新事件的人工核实。初始发布资源共 146 个内容文件（曲库加封面），约 32.2 MB，不包含原始谱面和音频。具体版本、计数、大小以 `validate --release` 的实际输出为准。
+148 个游戏更新时间仍为空，等待真实游戏更新事件的人工核实。发布内容文件为曲库、封面、完整 ACB 与官方谱面 JSON。具体版本、计数、大小以 `validate --release` 的实际输出为准。
 
 ## 验证
 

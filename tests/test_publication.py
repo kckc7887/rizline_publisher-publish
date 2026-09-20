@@ -13,9 +13,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
-from test_publisher import MemoryS3, fixture, overrides
+from test_publisher import MemoryS3, fixture, overrides, sample_acb, write_fixture_assets
 from rizline_publisher.core import (atomic_write, build, json_bytes, parallel_map,
                                    publish, read_json, sha256, validate_release)
+from rizline_publisher.audio import acb_duration
 from rizline_publisher.publication import (CURRENT, _delete_objects_content_md5,
                                           beijing_release_date, cleanup_snapshot, manifests_equal,
                                           make_client, next_date_name, retry_cleanup, verify_remote_object)
@@ -28,7 +29,7 @@ class PublicationTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.source, self.override, self.output = self.root / "source/catalog.json", self.root / "overrides.json", self.root / "dist"
         atomic_write(self.source, json_bytes(fixture()))
-        atomic_write(self.source.parent / "covers/test.png", base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aH9sAAAAASUVORK5CYII="))
+        write_fixture_assets(self.source.parent)
         atomic_write(self.override, json_bytes(overrides()))
         build(self.source, self.override, self.output)
         self.client = MemoryS3()
@@ -67,7 +68,7 @@ class PublicationTests(unittest.TestCase):
         self.assertNotEqual(selected["resourceVersion"], json.loads(original)["resourceVersion"])
         self.assertEqual((self.output / CURRENT).read_bytes(), original)
         self.assertEqual(validate_release(self.root / "work/publication-release")["resourceVersion"], selected["resourceVersion"])
-        self.assertEqual(result["publication"]["uploaded"], 4)
+        self.assertEqual(result["publication"]["uploaded"], 6)
         self.assertEqual(result["publication"]["copied"], 0)
         self.assertEqual(self.client.order[-2:], [selected["manifestPath"], CURRENT])
         for request in self.client.requests:
@@ -121,12 +122,12 @@ class PublicationTests(unittest.TestCase):
         result = self.execute()
         selected = self.pointer()
         self.assertEqual(selected["resourceVersion"], "2026-09-14-2")
-        self.assertEqual(result["publication"]["copied"], 1)
+        self.assertEqual(result["publication"]["copied"], 3)
         self.assertEqual(result["publication"]["uploaded"], 3)
         self.assertEqual(len([r for r in self.client.requests if r["Key"].endswith(".png")]), 0)
         copies = [event for event in self.client.events if event[0] == "copy"]
-        self.assertEqual(len(copies), 1)
-        self.assertTrue(copies[0][1].endswith(".png"))
+        self.assertEqual(len(copies), 3)
+        self.assertEqual(sorted(event[1].rsplit(".", 1)[-1] for event in copies), ["acb", "json", "png"])
         self.assertTrue(copies[0][2].startswith("rizline/releases/2026-09-14-2/"))
         self.assertTrue(previous.isdisjoint(self.client.values))
         self.assertNotIn(leftover, self.client.values)
@@ -151,7 +152,7 @@ class PublicationTests(unittest.TestCase):
                     publication_output=self.root / "work" / f"publication-corrupt-{corrupted}",
                     report_path=self.root / "work" / f"publication-report-corrupt-{corrupted}.json",
                 )
-                self.assertEqual(result["publication"]["uploaded"], 4)
+                self.assertEqual(result["publication"]["uploaded"], 6)
                 self.assertNotEqual(self.pointer()["resourceVersion"], old["resourceVersion"])
                 self.assertTrue(all(old["resourceVersion"] + "/" not in key for key in self.client.order))
 
@@ -172,6 +173,7 @@ class PublicationTests(unittest.TestCase):
         self.client.seed(CURRENT, json_bytes(old))
         result = self.execute()
         self.assertEqual(result["publication"]["uploaded"], 4)
+        self.assertEqual(result["publication"]["copied"], 2)
         self.assertEqual(result["publication"]["comparisonReason"], "different-resource-set")
 
     def test_remote_permission_error_does_not_mean_missing_manifest(self):
@@ -208,7 +210,7 @@ class PublicationTests(unittest.TestCase):
             if path.endswith(".png"):
                 running.set()
                 self.assertTrue(release.wait(5))
-            else:
+            elif path.endswith("catalog.json"):
                 self.assertTrue(running.wait(5))
                 fail_now.set()
                 raise OSError("resource verification failed")
@@ -364,7 +366,7 @@ class PublicationTests(unittest.TestCase):
         self.client.seed("rizline/releases/foreign-staging/file")
         self.update()
         self.execute()
-        self.assertEqual([len(r["Delete"]["Objects"]) for r in self.client.delete_requests], [1000, 5])
+        self.assertEqual([len(r["Delete"]["Objects"]) for r in self.client.delete_requests], [1000, 7])
         self.assertNotIn("rizline/releases/foreign-staging/file", self.client.values)
         self.assertTrue(any("ContinuationToken" in r for r in self.client.list_requests))
         self.assertTrue(any(request["Prefix"] == "rizline/releases/" for request in self.client.list_requests))
@@ -434,8 +436,10 @@ class WorkerTests(unittest.TestCase):
             importer.config = {"version": "1.0"}
             importer.version = "v1"
             importer.cover.return_value = b"PNG bytes"
-            importer.duration.return_value = 100.0
-            importer.text.side_effect = lambda key: b"" if key.startswith("local.") else json_bytes({"bPM": 150, "lines": [{"notes": [{"type": 0}, {"type": 2}]}]})
+            acb = sample_acb()
+            importer.acb.return_value = acb
+            chart_raw = json_bytes({"bPM": 150, "lines": [{"notes": [{"type": 0}, {"type": 2}]}]})
+            importer.text.side_effect = lambda key: b"" if key.startswith("local.") else chart_raw
             names = set()
             barrier = threading.Barrier(2)
             def parallel_stats(value):
@@ -447,6 +451,9 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(len(names), 2)
             catalog = read_json(root / "work/catalog.json")
             self.assertEqual([chart["hit"] for chart in catalog["songs"][0]["charts"]], [3, 3])
+            self.assertEqual(catalog["songs"][0]["durationSeconds"], acb_duration(acb))
+            self.assertEqual((root / "work" / catalog["songs"][0]["audioPath"]).read_bytes(), acb)
+            self.assertEqual((root / "work" / catalog["songs"][0]["charts"][0]["chartPath"]).read_bytes(), chart_raw)
             before = (root / "work/catalog.json").read_bytes()
             importer.cover.side_effect = OSError("cover unavailable")
             with patch("rizline_publisher.upstream.Importer", return_value=importer), self.assertRaisesRegex(ValueError, "catalog unchanged"):
