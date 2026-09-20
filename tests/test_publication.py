@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
-from test_publisher import MemoryS3, fixture, overrides, sample_acb, write_fixture_assets
+from test_publisher import MemoryS3, fake_transcode, fixture, overrides, sample_acb, write_fixture_assets
 from rizline_publisher.core import (atomic_write, build, json_bytes, parallel_map,
                                    publish, read_json, sha256, validate_release)
 from rizline_publisher.audio import acb_duration
@@ -31,6 +31,9 @@ class PublicationTests(unittest.TestCase):
         atomic_write(self.source, json_bytes(fixture()))
         write_fixture_assets(self.source.parent)
         atomic_write(self.override, json_bytes(overrides()))
+        self.transcode = patch("rizline_publisher.transcode.transcode_acb", side_effect=fake_transcode)
+        self.transcode.start()
+        self.addCleanup(self.transcode.stop)
         build(self.source, self.override, self.output)
         self.client = MemoryS3()
 
@@ -75,6 +78,8 @@ class PublicationTests(unittest.TestCase):
             self.assertEqual(request["IfNoneMatch"], "*")
             self.assertIn("ContentMD5", request)
             self.assertEqual(request["CacheControl"], "no-cache" if request["Key"] == CURRENT else "public, max-age=31536000, immutable")
+            if request["Key"].endswith(".m4a"):
+                self.assertEqual(request["ContentType"], "audio/mp4")
         for path in self.client.order[:-2]:
             self.assertLess(self.client.events.index(("put", path)), self.client.events.index(("get", path)))
             self.assertLess(self.client.events.index(("get", path)), self.client.events.index(("put", selected["manifestPath"])))
@@ -127,7 +132,7 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(len([r for r in self.client.requests if r["Key"].endswith(".png")]), 0)
         copies = [event for event in self.client.events if event[0] == "copy"]
         self.assertEqual(len(copies), 3)
-        self.assertEqual(sorted(event[1].rsplit(".", 1)[-1] for event in copies), ["acb", "json", "png"])
+        self.assertEqual(sorted(event[1].rsplit(".", 1)[-1] for event in copies), ["json", "m4a", "png"])
         self.assertTrue(copies[0][2].startswith("rizline/releases/2026-09-14-2/"))
         self.assertTrue(previous.isdisjoint(self.client.values))
         self.assertNotIn(leftover, self.client.values)

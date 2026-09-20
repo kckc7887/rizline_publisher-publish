@@ -263,7 +263,7 @@ def supplement_template(catalog):
     return result
 
 
-def build(source, overrides, output, workers=4):
+def build(source, overrides, output, workers=4, transcode_cache=None):
     check_workers(workers)
     log_progress(f"build hash-and-write workers={workers}")
     source, output = Path(source), Path(output)
@@ -282,8 +282,22 @@ def build(source, overrides, output, workers=4):
     def verify_png(data):
         if not data.startswith(b"\x89PNG\r\n\x1a\n"):
             raise ValueError("Imported covers must be PNG images")
+    from .transcode import is_m4a, transcode_acb
+    cache = Path(transcode_cache) if transcode_cache is not None else Path(".cache/transcode")
+    def hashed_audio(paths):
+        def convert(path):
+            acb = contained_path(source.parent, path).read_bytes()
+            duration = acb_duration(acb)
+            data = transcode_acb(acb, cache, duration)
+            if not is_m4a(data):
+                raise ValueError(f"Transcoded audio is not M4A: {path}")
+            return path, sha256(data), data
+        def report(done, total, path):
+            log_progress(f"transcode-audio {done}/{total} {path}")
+        items = parallel_map(convert, sorted(paths), workers, progress=report) if paths else []
+        return {digest: data for _, digest, data in items}, {path: digest for path, digest, _ in items}
     cover_bytes, cover_hashes = hashed_files({s["coverPath"] for s in catalog["songs"] if s["coverPath"]}, verify_png, "hash-cover")
-    audio_bytes, audio_hashes = hashed_files({s["audioPath"] for s in catalog["songs"]}, acb_duration, "hash-audio")
+    audio_bytes, audio_hashes = hashed_audio({s["audioPath"] for s in catalog["songs"]})
     chart_bytes, chart_hashes = hashed_files({c["chartPath"] for s in catalog["songs"] for c in s["charts"]}, json.loads, "hash-chart")
     for song in catalog["songs"]:
         if song["coverPath"]:
@@ -303,7 +317,7 @@ def build(source, overrides, output, workers=4):
             song["coverPath"] = f"{prefix}/covers/{digest}.png"
             payloads[song["coverPath"]] = cover_bytes[digest]
         digest = song["audioPath"]
-        song["audioPath"] = f"{prefix}/audio/{digest}.acb"
+        song["audioPath"] = f"{prefix}/audio/{digest}.m4a"
         payloads[song["audioPath"]] = audio_bytes[digest]
         for chart in song["charts"]:
             digest = chart["chartPath"]
@@ -376,6 +390,8 @@ def validate_catalog_release(catalog, manifest):
             raise ValueError("Cover is not in the manifest")
         if song["audioPath"] not in paths:
             raise ValueError("Audio is not in the manifest")
+        if not song["audioPath"].endswith(".m4a"):
+            raise ValueError("Published audio must be AAC/M4A")
         for chart in song["charts"]:
             if chart["chartPath"] not in paths:
                 raise ValueError("Chart is not in the manifest")

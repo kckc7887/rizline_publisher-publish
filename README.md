@@ -38,7 +38,7 @@ API 端点、桶名和签名参数均已内置，不需要创建 Variables 或�
 
 1. 在 **Actions → 构建与发布曲库 → Run workflow** 选择 `main`。首次可保持实际上传不勾选，生成资源检查报告。
 2. `upload_workers` 默认 `16`，可选择 `1 / 4 / 8 / 12 / 16`；`parse_workers` 默认 `4`，可选择 `1 / 2 / 4 / 8`。定时运行上传并发为 `16`、解析并发为 `4`。解析、构建与本地校验复用有界工作池；每次实际上传及远端 GET 校验也并行执行，排队任务最多为工作线程数的两倍。
-3. `rizline-release-<运行ID>-<尝试次数>` 是确定性构建包，`rizline-reports-<运行ID>-<尝试次数>` 是导入报告。实际发布另存 `rizline-publication-<运行ID>-<尝试次数>`，包含真正选中的发布版本；`rizline-publication-report-<运行ID>-<尝试次数>` 包含成功或失败阶段、指针结果及精确清理重试记录。失败候选包不代表已上线，以报告为准。产物均保留 90 天，发布包含封面、完整 ACB 与官方谱面 JSON；不含 HTTP 缓存。
+3. `rizline-release-<运行ID>-<尝试次数>` 是确定性构建包，`rizline-reports-<运行ID>-<尝试次数>` 是导入报告。实际发布另存 `rizline-publication-<运行ID>-<尝试次数>`，包含真正选中的发布版本；`rizline-publication-report-<运行ID>-<尝试次数>` 包含成功或失败阶段、指针结果及精确清理重试记录。失败候选包不代表已上线，以报告为准。产物均保留 90 天，发布包含封面、AAC/M4A 与官方谱面 JSON；不含 HTTP 缓存与转码缓存。
 4. 两个 KEY 配置完成后，每天会自动实际发布；需要立即运行时，勾选实际上传。已有 `manifest.json` 就是唯一资源清单：游戏版本和文件身份（相对路径、大小、SHA-256）一致时跳过上传；对不上时按北京日期开新目录，未变资源 CopyObject，只 PUT 新增和变更，再条件切换 current。切换成功后删除 `rizline/releases/` 下不属于新 current 的对象。GitHub Actions 实际发布带 `--delta-only`，不能对照线上版本时直接失败，不会再从海外整包 PUT。
 
 多次发布工作流通过同一 concurrency group 串行执行，不取消正在发布的运行；资源文件在每次运行内部并行处理。上传失败时取消排队任务并等待在途任务结束，后续 manifest/current 阶段不执行。本地 CLI 复用相同事务；独立发布者同时运行时，current 的 ETag 条件写入阻止旧运行覆盖新指针。
@@ -51,7 +51,7 @@ API 端点、桶名和签名参数均已内置，不需要创建 Variables 或�
 
 ## 本地使用
 
-需要 Python 3.10+；当前实测 Python 3.13、UnityPy 1.10.18、PowerShell 7。Windows 自动使用 PowerShell 的系统网络链路；其它平台使用 Python urllib。没有 `.venv` 时脚本会使用 `py`。
+需要 Python 3.10+、`vgmstream-cli`、`ffmpeg` 和 `ffprobe`；当前实测 Python 3.13、UnityPy 1.10.18、PowerShell 7。Windows 自动使用 PowerShell 的系统网络链路；其它平台使用 Python urllib。没有 `.venv` 时脚本会使用 `py`。
 
 ```powershell
 Set-Location 'D:\Projects\rizline-resource-publisher'
@@ -62,7 +62,7 @@ pwsh -File .\publish-local.ps1
 
 只看上传计划：`pwsh -File .\publish-local.ps1 -Plan`。已导入并构建、只需重新上传：`pwsh -File .\publish-local.ps1 -PublishOnly`。导入、构建、校验和实际上传的并发可用 `-ImportWorkers`、`-BuildWorkers`、`-UploadWorkers` 覆盖。进度写到 stderr，每完成一个并行任务打一行。
 
-`publish` 默认只展示上传计划。`import` 初次需要下载当前版本的索引资源、全部谱面、封面和完整音频；后续复用按 URL 存储的本地缓存。完整 ACB 与官方谱面 JSON 进入发布目录；时长仍按 ACB 元数据核验，HIT/COMBO 仍按谱面 note 统计。导入默认 4 个并发。中途失败可直接重试，旧曲库不会被部分结果替换。
+`publish` 默认只展示上传计划。`import` 初次需要下载当前版本的索引资源、全部谱面、封面和完整音频；后续复用按 URL 存储的本地缓存。导入仍保存官方 ACB 供时长核验与转码；`build` 用 `vgmstream-cli` 解码、`ffmpeg` 编码为 AAC/M4A 后写入发布目录。HIT/COMBO 仍按谱面 note 统计。导入默认 4 个并发。中途失败可直接重试，旧曲库不会被部分结果替换。本地构建需要 PATH 上的 `vgmstream-cli`、`ffmpeg` 和 `ffprobe`（可用 `VGMSTREAM_CLI` / `FFMPEG` / `FFPROBE` 指定路径）。转码结果按 ACB SHA-256 缓存在 `.cache/transcode/`。
 
 ## 日常维护
 
@@ -160,10 +160,10 @@ Get-ChildItem -LiteralPath '.\dist\rizline\releases' -Directory | Select-Object 
 - BPM 是官方谱面 `bPM × bpmShifts.value` 的范围，消除 float32 误差后保留最多三位小数。它包含谱面中的速度变化，允许用核实的歌曲 BPM 进行人工修订。
 - HIT 为所有 note 数量加 HOLD 数量，HOLD 头尾分别计入。COMBO 使用实际 HIT 分段倍率：前 5 HIT 各 1、接着 3 HIT 各 2、接着 3 HIT 各 3、其后各 4。
 - Riztime HIT 初始补充源固定为 [limmy114/rizline-tool 的已审阅提交](https://github.com/limmy114/rizline-tool/blob/a7e1ae23aaae215c36710899af363bc71ae32634/index.html)。只解析其中 JSON 数据字面量，不执行网页 JavaScript。使用“曲名标准化或已审阅 ID 别名 + 官方 HIT 一致”双重匹配；Max Score 为 `1,000,000 + 100 × Riztime HIT`。官方定数始终优先。要使用新提交，可传 `import --stats-url 'https://raw.githubusercontent.com/.../提交SHA/index.html'`；`--stats-url ''` 可完全关闭补充源。不要直接依赖浮动分支作为正式发布来源。
-- 完整时长来自官方 ACB 的 `WaveformTable.NumSamples / SamplingRate`，并与其内嵌完整 HCA 帧数、编码延迟及尾部填充交叉核验。不使用歌曲试听片段或谱面最后一个音符估算时长。格式实现参考 [CRI UTF](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/util/cri_utf.c)、[AFS2](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/meta/awb.c) 和 [HCA 元数据](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/coding/libs/clhca.c)，来源角色、核验快照与许可见 [第三方代码声明](THIRD_PARTY_NOTICES.md#vgmstream-格式实现参考)。仅读取格式元数据，无需解密或解码音频。
+- 完整时长来自官方 ACB 的 `WaveformTable.NumSamples / SamplingRate`，并与其内嵌完整 HCA 帧数、编码延迟及尾部填充交叉核验。不使用歌曲试听片段或谱面最后一个音符估算时长。格式实现参考 [CRI UTF](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/util/cri_utf.c)、[AFS2](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/meta/awb.c) 和 [HCA 元数据](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/coding/libs/clhca.c)，来源角色、核验快照与许可见 [第三方代码声明](THIRD_PARTY_NOTICES.md#vgmstream-格式实现参考)。时长核验只读公开元数据；发布音频则由 `vgmstream-cli` 解码后经 `ffmpeg` 转成 AAC/M4A，并以 ffprobe 时长与 ACB 时长交叉核对。
 - 相关成就的名称和条件来自官方简体中文本地化，去除显示用富文本标签。只关联条件中明确涉及的歌曲；通用成就和整个 Disc 的完成成就不散发到每首歌。普通歌曲成就不会因为同名自动附加到 SP。
 - `updatedAt` 专指游戏中歌曲/谱面的最近一次更新日期，格式 `YYYY-MM-DD`。官方资源表没有逐曲日期，所以初始值为空，待结合官方公告/Wiki 真实更新事件人工填写。HTTP Last-Modified、Wiki 编辑时间、导入时间均不替代这个字段。
-- 游戏美术、音乐和相关署名归原权利人所有；本项目发布曲库元数据、展示封面、完整官方 ACB 与官方谱面 JSON。时长仍只读取 ACB 公开元数据，不解密或解码音频。
+- 游戏美术、音乐和相关署名归原权利人所有；本项目发布曲库元数据、展示封面、AAC/M4A 与官方谱面 JSON。时长仍以 ACB 公开元数据为准；发布对象不再包含 ACB。
 
 ## 输出合同与项目结构
 
@@ -175,7 +175,7 @@ dist/
   rizline/releases/<resourceVersion>/manifest.json
   rizline/releases/<resourceVersion>/catalog.json
   rizline/releases/<resourceVersion>/covers/<sha256>.png
-  rizline/releases/<resourceVersion>/audio/<sha256>.acb
+  rizline/releases/<resourceVersion>/audio/<sha256>.m4a
   rizline/releases/<resourceVersion>/charts/<sha256>.json
 ```
 
@@ -183,12 +183,13 @@ dist/
 
 构建版本由官方资源版本与最终元数据/封面/音频/谱面摘要共同决定。同样的输入产生同样的版本；任何人工修订或资源内容变化都会产生新版本。先写完整版本，再原子替换本地 current。
 
-这里的相同输入指最终元数据与 PNG、ACB、谱面 JSON 文件字节相同。不同平台的 PNG 编码字节可能不同，即使封面像素一致，跨平台导入也可能生成不同的资源版本号。需要重发同一准确版本时，直接复用已归档的发布产物。
+这里的相同输入指最终元数据与 PNG、M4A、谱面 JSON 文件字节相同。不同平台的 PNG 编码或 ffmpeg AAC 编码器字节可能不同，即使封面像素与 PCM 一致，跨平台导入/转码也可能生成不同的资源版本号。需要重发同一准确版本时，直接复用已归档的发布产物。
 
 | 路径 | 职责 |
 | --- | --- |
 | `rizline_publisher/upstream.py` | 唯一 HTTP/cache 边界，Addressables、官方资源导入和经核验的统计补充 |
 | `rizline_publisher/audio.py` | CRI UTF、AFS2、HCA 元数据时长核验 |
+| `rizline_publisher/transcode.py` | 调用本机 `vgmstream-cli` / `ffmpeg` 将导入 ACB 转为 AAC/M4A |
 | `rizline_publisher/core.py` | 唯一合同校验、人工修订合并、确定性构建、有界并发与兼容发布入口 |
 | `rizline_publisher/publication.py` | 文件身份比较、日期目录差量归档、S3 条件发布与残留前缀清理重试 |
 | `rizline_publisher/storage_check.py` | 独立临时键上的 S3 条件写入和 CopyObject 能力核验 |
@@ -197,7 +198,7 @@ dist/
 | `overrides.json` | 应纳入版本管理的个人人工数据 |
 | `.github/workflows/validate.yml` | push、Pull Request 与手动校验 |
 | `.github/workflows/publish.yml` | 每日北京时间 20:00 自动发布、手动构建/发布、实际版本归档、差量上传和残留目录清理 |
-| `.cache/` | 只保留本地的上游原始文件缓存 |
+| `.cache/` | 只保留本地的上游原始文件缓存与 ACB→M4A 转码缓存 |
 | `work/` | 只保留本地的导入结果、发布归档、报告与独立清理重试记录 |
 | `dist/` | 只保留本地的待发布资源 |
 | `tests/` | 不依赖网络的解析、校验、事务和数据边界测试 |
@@ -208,7 +209,7 @@ dist/
 
 当前初始输入为官方 `2.7.1 / v141_2_7_1_3c13bbff2bP`：148 个独立歌曲条目、438 张谱面、145 张不同封面。全部歌曲已有完整音频时长、BPM、曲师和画师；全部谱面已有谱师、HIT 和 COMBO。435 张普通谱面有 Max Score 和 Riztime HIT，3 张 SP 的这两个字段为空。相关成就共 28 处歌曲关联。
 
-148 个游戏更新时间仍为空，等待真实游戏更新事件的人工核实。发布内容文件为曲库、封面、完整 ACB 与官方谱面 JSON。具体版本、计数、大小以 `validate --release` 的实际输出为准。
+148 个游戏更新时间仍为空，等待真实游戏更新事件的人工核实。发布内容文件为曲库、封面、AAC/M4A 与官方谱面 JSON。具体版本、计数、大小以 `validate --release` 的实际输出为准。
 
 ## 验证
 

@@ -6,6 +6,8 @@
 
 `rizline_publisher/audio.py` 参照 vgmstream 对 CRI UTF、AFS2 和 HCA 头部的解析，使用 Python 实现仅供完整时长核验的元数据读取。它读取采样数、采样率、帧数、编码延迟和填充，并交叉检查边界；不包含 vgmstream 的播放、音频解码或解密实现。
 
+发布音频由 `rizline_publisher/transcode.py` 调用本机已安装的 [vgmstream-cli](https://github.com/vgmstream/vgmstream) 解码导入的 ACB，再调用本机 `ffmpeg` / `ffprobe` 编码并核验 AAC/M4A。仓库不捆绑这些二进制；GitHub Actions 的发布工作流固定下载 [vgmstream r2117 的 linux zip](https://github.com/vgmstream/vgmstream/releases/download/r2117/vgmstream-linux.zip)，并用发行版 `ffmpeg`。调用外部工具不改变 vgmstream `COPYING` 对参考实现与 CLI 的许可范围。本机 `ffmpeg` / `ffprobe` 的许可证以安装版本为准，发布器不重新分发其代码。
+
 来源为 [vgmstream/vgmstream](https://github.com/vgmstream/vgmstream)。以下链接固定于 2026-09-14 许可核验时的提交 `e6afeaacf433bfafd38d873f80c94517e09d5b96`，是本次核验快照，并非声称原实现曾锁定此版本：
 
 - [src/util/cri_utf.c](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/src/util/cri_utf.c)：UTF 表头、列类型与存储方式，以及 HCA v3 单行表头超出声明行宽的兼容行为。
@@ -14,7 +16,7 @@
 
 vgmstream 使用其根目录 `COPYING` 中的 ISC 式许可。完整版权声明、各项 Portions 归属、授权条件和免责声明原样保存在 [LICENSES/vgmstream-COPYING.txt](LICENSES/vgmstream-COPYING.txt)，对应[上游原文](https://github.com/vgmstream/vgmstream/blob/e6afeaacf433bfafd38d873f80c94517e09d5b96/COPYING)。复制或分发上述参考实现的相关代码时，应同时保留该文件和本节归属说明。
 
-此外保留 `clhca.c` 文件头列出的来源角色：nyaga 完成原始反编译及 C++ 解码器；kode54 移植为 C；bnnm 清理代码并再次分析 HCA v3，过程中参考 Thealexbarney 的 VGAudio 解码器；Youjose 提供 Ambisonics 信息。这些归属来自上游文件头，不表示发布器包含上述完整解码器。
+此外保留 `clhca.c` 文件头列出的来源角色：nyaga 完成原始反编译及 C++ 解码器；kode54 移植为 C；bnnm 清理代码并再次分析 HCA v3，过程中参考 Thealexbarney 的 VGAudio 解码器；Youjose 提供 Ambisonics 信息。这些归属来自上游文件头。元数据读取仍不内嵌完整解码器；实际解码通过本机 `vgmstream-cli` 完成。
 
 本项目的实现范围与调整：用 Python `struct` 和整数读取元数据，以单个 waveform 的 ACB 为输入，增加采样数、帧长和文件完整性相互核验，拒绝需要额外 cue 映射的多 waveform 输入。
 

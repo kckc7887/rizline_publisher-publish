@@ -374,6 +374,8 @@ def object_content_type(path):
         return "image/png"
     if path.endswith(".json"):
         return "application/json; charset=utf-8"
+    if path.endswith(".m4a"):
+        return "audio/mp4"
     return "application/octet-stream"
 
 

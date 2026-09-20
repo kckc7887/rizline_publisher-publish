@@ -197,6 +197,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("${{", group)
         self.assertEqual(scalar(concurrency, "cancel-in-progress", 2), "false")
 
+    def test_build_installs_pinned_vgmstream_before_release_build(self):
+        install = self.one_step(self.build_steps, lambda run: "vgmstream-linux.zip" in run)
+        release = self.one_step(self.build_steps, lambda run: "rizline_publisher build" in run)
+        self.assertIn("r2117", command(install))
+        self.assertIn("2f98c77f756079f63fbd119939067f1ed461d77e70993bc4cc372736d859c84a", command(install))
+        self.assertIn("ffmpeg", command(install))
+        self.assertLess(self.build_steps.index(install), self.build_steps.index(release))
+
     def test_parse_concurrency_reaches_import_build_and_local_validation(self):
         candidates = [step for step in self.build_steps if "$PARSE_WORKERS" in command(step)]
         self.assertEqual(len(candidates), 2)

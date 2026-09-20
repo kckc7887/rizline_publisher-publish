@@ -32,6 +32,12 @@ def overrides():
 
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aH9sAAAAASUVORK5CYII=")
 CHART_JSON = json_bytes({"bPM": 150, "lines": []})
+SAMPLE_M4A = b"\x00\x00\x00\x18ftypM4A " + bytes(64)
+
+
+def fake_transcode(acb, cache_dir, expected_duration):
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    return SAMPLE_M4A
 
 
 def cri_utf_table(fields):
@@ -170,6 +176,9 @@ class PublisherTests(unittest.TestCase):
         # Local PNG/ACB/JSON fixtures; no network is needed for tests.
         write_fixture_assets(self.source.parent)
         atomic_write(self.override, json_bytes(overrides()))
+        self.transcode = patch("rizline_publisher.transcode.transcode_acb", side_effect=fake_transcode)
+        self.transcode.start()
+        self.addCleanup(self.transcode.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -195,9 +204,9 @@ class PublisherTests(unittest.TestCase):
         catalog = read_json(self.output / manifest["catalogPath"])
         paths = {asset["path"] for asset in manifest["files"]}
         song = catalog["songs"][0]
-        self.assertTrue(song["audioPath"].endswith(".acb") and song["audioPath"] in paths)
+        self.assertTrue(song["audioPath"].endswith(".m4a") and song["audioPath"] in paths)
         self.assertTrue(song["charts"][0]["chartPath"].endswith(".json") and song["charts"][0]["chartPath"] in paths)
-        self.assertEqual((self.output / song["audioPath"]).read_bytes(), sample_acb())
+        self.assertEqual((self.output / song["audioPath"]).read_bytes(), SAMPLE_M4A)
         self.assertEqual((self.output / song["charts"][0]["chartPath"]).read_bytes(), CHART_JSON)
         template = read_json(self.source.parent / "supplement-template.json")
         self.assertNotIn("updatedAt", template["songs"]["Song.artist.0"])
