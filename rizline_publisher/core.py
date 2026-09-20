@@ -390,8 +390,6 @@ def validate_catalog_release(catalog, manifest):
             raise ValueError("Cover is not in the manifest")
         if song["audioPath"] not in paths:
             raise ValueError("Audio is not in the manifest")
-        if not song["audioPath"].endswith(".m4a"):
-            raise ValueError("Published audio must be AAC/M4A")
         for chart in song["charts"]:
             if chart["chartPath"] not in paths:
                 raise ValueError("Chart is not in the manifest")
@@ -414,6 +412,8 @@ def validate_release(root, current=None, workers=4):
     parallel_map(verify_asset, manifest["files"], workers, progress=report)
     catalog = read_json(contained_path(root, manifest["catalogPath"]))
     summary = validate_catalog_release(catalog, manifest)
+    if any(not song["audioPath"].endswith(".m4a") for song in catalog["songs"]):
+        raise ValueError("Published audio must be AAC/M4A")
     return {"resourceVersion": current["resourceVersion"], "files": len(manifest["files"]), "bytes": sum(a["size"] for a in manifest["files"]), **summary}
 
 

@@ -63,6 +63,34 @@ class PublicationTests(unittest.TestCase):
             self.client.seed(path, (self.output / path).read_bytes())
         return selected, manifest
 
+    def rewrite_remote_audio_extension(self, current, manifest, new_suffix):
+        catalog_path = manifest["catalogPath"]
+        catalog = json.loads(self.client.values[catalog_path]["Body"])
+        files = []
+        for asset in manifest["files"]:
+            asset = dict(asset)
+            path = asset["path"]
+            if path.endswith(".m4a") or path.endswith(".acb"):
+                new_path = path.rsplit(".", 1)[0] + new_suffix
+                self.client.values[new_path] = self.client.values.pop(path)
+                asset["path"] = new_path
+            files.append(asset)
+        for song in catalog["songs"]:
+            song["audioPath"] = song["audioPath"].rsplit(".", 1)[0] + new_suffix
+        catalog_bytes = json_bytes(catalog)
+        catalog_asset = next(asset for asset in files if asset["path"] == catalog_path)
+        catalog_asset["size"] = len(catalog_bytes)
+        catalog_asset["sha256"] = sha256(catalog_bytes)
+        self.client.seed(catalog_path, catalog_bytes)
+        rewritten = dict(manifest)
+        rewritten["files"] = files
+        raw = json_bytes(rewritten)
+        pointer = dict(current)
+        pointer["manifestSha256"] = sha256(raw)
+        self.client.seed(pointer["manifestPath"], raw)
+        self.client.seed(CURRENT, json_bytes(pointer))
+        return pointer, rewritten
+
     def test_full_upload_is_isolated_conditional_and_archives_actual_release(self):
         original = (self.output / CURRENT).read_bytes()
         result = self.execute()
@@ -259,6 +287,19 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(result["publication"]["copied"], 3)
         self.assertGreater(result["publication"]["uploaded"], 0)
         self.assertTrue(previous.isdisjoint(self.client.values))
+
+    def test_delta_only_accepts_previous_acb_catalog_and_uploads_m4a(self):
+        current, manifest = self.seed_build()
+        self.rewrite_remote_audio_extension(current, manifest, ".acb")
+        result = self.execute(delta_only=True)
+        selected = self.pointer()
+        self.assertEqual(result["publication"]["status"], "published")
+        self.assertEqual(result["publication"]["copied"], 2)
+        self.assertGreaterEqual(result["publication"]["uploaded"], 2)
+        catalog = json.loads(self.client.values[selected["manifestPath"].replace("manifest.json", "catalog.json")]["Body"])
+        self.assertTrue(all(song["audioPath"].endswith(".m4a") for song in catalog["songs"]))
+        self.assertTrue(any(key.endswith(".m4a") for key in self.client.values))
+        self.assertFalse(any(key.endswith(".acb") for key in self.client.values))
 
     def test_identical_resource_put_precondition_is_treated_as_already_uploaded(self):
         self.client.race = "identical"
